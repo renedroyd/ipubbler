@@ -3,6 +3,7 @@ import { cors } from 'hono/cors'
 import { clearSessionCookie, createSession, getSessionUser, hashPassword, requireAuth, setSessionCookie, verifyPassword, digest } from './auth'
 import { deleteMedia, uploadMedia } from './media'
 import { processDuePosts } from './scheduler'
+import { encryptMetaToken, MetaClient, requireMetaEncryptionSecret } from './meta'
 import type { AppEnv, PostStatus } from './types'
 
 const app = new Hono<AppEnv>()
@@ -42,6 +43,9 @@ app.use('/api/posts', requireAuth)
 app.use('/api/posts/*', requireAuth)
 app.use('/api/media/*', requireAuth)
 app.use('/api/dashboard/*', requireAuth)
+app.use('/api/meta/*', requireAuth)
+app.use('/api/destinations/*', requireAuth)
+app.use('/api/destinations', requireAuth)
 
 app.get('/api/posts', async (c) => {
   const user = c.get('user'); const status = c.req.query('status') as PostStatus | undefined; const limit = Math.min(Math.max(Number(c.req.query('limit') ?? 50), 1), 100)
@@ -79,9 +83,7 @@ app.delete('/api/posts/:id', async (c) => { const result = await c.env.DB.prepar
 app.post('/api/posts/:id/media', async (c) => uploadMedia(c, c.req.param('id')))
 
 app.get('/api/posts/:id/media', async (c) => {
-  const rows = await c.env.DB.prepare(
-    'SELECT m.id,m.post_id,m.filename,m.mime_type,m.size,m.sort_order,m.created_at FROM media m JOIN posts p ON p.id=m.post_id WHERE m.post_id=? AND p.user_id=? ORDER BY m.sort_order ASC, m.created_at ASC',
-  ).bind(c.req.param('id'), c.get('user').id).all()
+  const rows = await c.env.DB.prepare('SELECT m.id,m.post_id,m.filename,m.mime_type,m.size,m.sort_order,m.created_at FROM media m JOIN posts p ON p.id=m.post_id WHERE m.post_id=? AND p.user_id=? ORDER BY m.sort_order ASC, m.created_at ASC').bind(c.req.param('id'), c.get('user').id).all()
   return c.json({ media: rows.results })
 })
 
@@ -93,16 +95,11 @@ app.get('/api/posts/:id/logs', async (c) => {
 })
 
 app.get('/api/media/:id', async (c) => {
-  const media = await c.env.DB.prepare(
-    'SELECT m.id,m.r2_key,m.filename,m.mime_type,m.size FROM media m JOIN posts p ON p.id=m.post_id WHERE m.id=? AND p.user_id=?',
-  ).bind(c.req.param('id'), c.get('user').id).first<{ id:string; r2_key:string; filename:string; mime_type:string; size:number }>()
+  const media = await c.env.DB.prepare('SELECT m.id,m.r2_key,m.filename,m.mime_type,m.size FROM media m JOIN posts p ON p.id=m.post_id WHERE m.id=? AND p.user_id=?').bind(c.req.param('id'), c.get('user').id).first<{ id:string; r2_key:string; filename:string; mime_type:string; size:number }>()
   if (!media) return c.json({ error: 'Multimedia no encontrada' }, 404)
   const object = await c.env.MEDIA_BUCKET.get(media.r2_key)
   if (!object) return c.json({ error: 'Archivo no encontrado' }, 404)
-  const headers = new Headers()
-  object.writeHttpMetadata(headers)
-  headers.set('etag', object.httpEtag)
-  headers.set('content-disposition', `inline; filename="${media.filename}"`)
+  const headers = new Headers(); object.writeHttpMetadata(headers); headers.set('etag', object.httpEtag); headers.set('content-disposition', `inline; filename="${media.filename}"`)
   return new Response(object.body, { headers })
 })
 
@@ -111,6 +108,51 @@ app.delete('/api/media/:id', async (c) => deleteMedia(c, c.req.param('id')))
 app.get('/api/dashboard/stats', async (c) => {
   const rows = await c.env.DB.prepare('SELECT status,COUNT(*) AS count FROM posts WHERE user_id=? GROUP BY status').bind(c.get('user').id).all<{status:string;count:number}>()
   const stats = { scheduled:0,published:0,draft:0,failed:0,processing:0 }; for (const row of rows.results) if (row.status in stats) stats[row.status as keyof typeof stats]=Number(row.count); return c.json({stats})
+})
+
+app.get('/api/meta/status', async (c) => {
+  const user = c.get('user')
+  const accounts = await c.env.DB.prepare('SELECT id,provider_user_id,name,token_expires_at,created_at,updated_at FROM facebook_accounts WHERE user_id=? ORDER BY created_at DESC').bind(user.id).all()
+  const destinations = await c.env.DB.prepare(`SELECT d.id,d.type,d.provider_id,d.name,d.metadata_json,d.created_at,d.updated_at FROM destinations d JOIN facebook_accounts a ON a.id=d.facebook_account_id WHERE a.user_id=? ORDER BY d.name`).bind(user.id).all()
+  return c.json({ configured: Boolean(c.env.META_APP_ID && c.env.META_APP_SECRET), accounts: accounts.results, destinations: destinations.results })
+})
+
+app.post('/api/meta/connect', async (c) => {
+  if (!c.env.META_APP_ID || !c.env.META_APP_SECRET) return c.json({ error: 'La integración Meta no está configurada en el Worker' }, 503)
+  let body: { access_token?: string }
+  try { body = await c.req.json() } catch { return c.json({ error: 'JSON inválido' }, 400) }
+  const userAccessToken = body.access_token?.trim()
+  if (!userAccessToken) return c.json({ error: 'access_token requerido' }, 400)
+  try {
+    const meta = new MetaClient(c.env)
+    const me = await meta.getMe(userAccessToken)
+    const pages = await meta.listPages(userAccessToken)
+    const secret = requireMetaEncryptionSecret(c.env)
+    const now = new Date().toISOString()
+    const accountId = crypto.randomUUID()
+    const encryptedUserToken = await encryptMetaToken(userAccessToken, secret)
+    await c.env.DB.prepare(`INSERT INTO facebook_accounts (id,user_id,provider_user_id,name,access_token_encrypted,token_expires_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(user_id,provider_user_id) DO UPDATE SET name=excluded.name,access_token_encrypted=excluded.access_token_encrypted,updated_at=excluded.updated_at`).bind(accountId,c.get('user').id,me.id,me.name,encryptedUserToken,null,now,now).run()
+    const account = await c.env.DB.prepare('SELECT id FROM facebook_accounts WHERE user_id=? AND provider_user_id=?').bind(c.get('user').id,me.id).first<{id:string}>()
+    if (!account) throw new Error('No se pudo guardar la cuenta Meta')
+    for (const page of pages.data ?? []) {
+      const encryptedPageToken = page.access_token ? await encryptMetaToken(page.access_token, secret) : null
+      await c.env.DB.prepare(`INSERT INTO destinations (id,facebook_account_id,type,provider_id,name,access_token_encrypted,metadata_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(facebook_account_id,type,provider_id) DO UPDATE SET name=excluded.name,access_token_encrypted=excluded.access_token_encrypted,metadata_json=excluded.metadata_json,updated_at=excluded.updated_at`).bind(crypto.randomUUID(),account.id,'page',page.id,page.name,encryptedPageToken,JSON.stringify({ tasks: page.tasks ?? [] }),now,now).run()
+    }
+    return c.json({ ok: true, account: { id: account.id, provider_user_id: me.id, name: me.name }, pages: (pages.data ?? []).map((page) => ({ id: page.id, name: page.name, tasks: page.tasks ?? [] })) })
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : 'No se pudo conectar Meta' }, 400)
+  }
+})
+
+app.get('/api/destinations', async (c) => {
+  const rows = await c.env.DB.prepare('SELECT d.id,d.type,d.provider_id,d.name,d.metadata_json,d.created_at,d.updated_at FROM destinations d JOIN facebook_accounts a ON a.id=d.facebook_account_id WHERE a.user_id=? ORDER BY d.name').bind(c.get('user').id).all()
+  return c.json({ destinations: rows.results })
+})
+
+app.delete('/api/destinations/:id', async (c) => {
+  const result = await c.env.DB.prepare('DELETE FROM destinations WHERE id IN (SELECT d.id FROM destinations d JOIN facebook_accounts a ON a.id=d.facebook_account_id WHERE d.id=? AND a.user_id=?)').bind(c.req.param('id'),c.get('user').id).run()
+  if (!result.meta.changes) return c.json({ error: 'Destino no encontrado' },404)
+  return c.json({ ok:true })
 })
 
 export default { fetch: app.fetch, async scheduled(_event: ScheduledEvent, env: AppEnv['Bindings'], _ctx: ExecutionContext) { await processDuePosts(env) } }
