@@ -87,6 +87,38 @@ app.get('/api/posts/:id/media', async (c) => {
   return c.json({ media: rows.results })
 })
 
+app.get('/api/posts/:id/destinations', async (c) => {
+  const post = await c.env.DB.prepare('SELECT id FROM posts WHERE id=? AND user_id=?').bind(c.req.param('id'), c.get('user').id).first()
+  if (!post) return c.json({ error: 'Publicación no encontrada' }, 404)
+  const rows = await c.env.DB.prepare(`SELECT d.id,d.type,d.provider_id,d.name,d.metadata_json,pd.status,pd.provider_post_id,pd.error_message,pd.published_at
+    FROM destinations d
+    JOIN post_destinations pd ON pd.destination_id=d.id
+    JOIN facebook_accounts a ON a.id=d.facebook_account_id
+    WHERE pd.post_id=? AND a.user_id=? ORDER BY d.name`).bind(c.req.param('id'), c.get('user').id).all()
+  return c.json({ destinations: rows.results })
+})
+
+app.put('/api/posts/:id/destinations', async (c) => {
+  const postId = c.req.param('id'); const userId = c.get('user').id
+  const post = await c.env.DB.prepare('SELECT id FROM posts WHERE id=? AND user_id=?').bind(postId, userId).first()
+  if (!post) return c.json({ error: 'Publicación no encontrada' }, 404)
+  let body: { destination_ids?: string[] }
+  try { body = await c.req.json() } catch { return c.json({ error: 'JSON inválido' }, 400) }
+  const ids = Array.from(new Set((body.destination_ids ?? []).filter((id): id is string => typeof id === 'string' && id.length > 0)))
+  if (ids.length > 0) {
+    const placeholders = ids.map(() => '?').join(',')
+    const owned = await c.env.DB.prepare(`SELECT d.id FROM destinations d JOIN facebook_accounts a ON a.id=d.facebook_account_id WHERE a.user_id=? AND d.id IN (${placeholders})`).bind(userId, ...ids).all<{id:string}>()
+    if (owned.results.length !== ids.length) return c.json({ error: 'Uno o más destinos no pertenecen a tu cuenta' }, 403)
+  }
+  const now = new Date().toISOString()
+  await c.env.DB.prepare('DELETE FROM post_destinations WHERE post_id=?').bind(postId).run()
+  for (const destinationId of ids) {
+    await c.env.DB.prepare(`INSERT INTO post_destinations (post_id,destination_id,status,provider_post_id,error_message,published_at,created_at,updated_at) VALUES (?,?, 'pending',NULL,NULL,NULL,?,?)`).bind(postId, destinationId, now, now).run()
+  }
+  const rows = await c.env.DB.prepare(`SELECT d.id,d.type,d.provider_id,d.name,d.metadata_json,pd.status,pd.provider_post_id,pd.error_message,pd.published_at FROM destinations d JOIN post_destinations pd ON pd.destination_id=d.id JOIN facebook_accounts a ON a.id=d.facebook_account_id WHERE pd.post_id=? AND a.user_id=? ORDER BY d.name`).bind(postId,userId).all()
+  return c.json({ destinations: rows.results })
+})
+
 app.get('/api/posts/:id/logs', async (c) => {
   const post = await c.env.DB.prepare('SELECT id FROM posts WHERE id=? AND user_id=?').bind(c.req.param('id'), c.get('user').id).first()
   if (!post) return c.json({ error: 'Publicación no encontrada' }, 404)
