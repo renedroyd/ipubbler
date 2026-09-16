@@ -1,4 +1,9 @@
 # Local-only secrets. Copy to .dev.vars and replace the placeholders.
 SESSION_SECRET=replace-with-a-long-random-secret
 SETUP_SECRET=replace-with-a-separate-setup-secret
-# META_ACCESS_TOKEN=configure-in-phase-2
+FRONTEND_URL=http://localhost:5173
+META_APP_ID=replace-with-meta-app-id
+META_APP_SECRET=replace-with-meta-app-secret
+META_TOKEN_ENCRYPTION_KEY=replace-with-at-least-32-character-secret
+META_GRAPH_VERSION=v26.0
+# META_REDIRECT_URI=http://localhost:5173/meta/callback
