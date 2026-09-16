@@ -4,6 +4,13 @@ import type { Env } from './types'
 const MAX_ATTEMPTS = 5
 
 export async function processDuePosts(env: Env): Promise<{ processed: number; published: number; failed: number }> {
+  // The current publisher is Meta-based. Do not consume scheduled posts while
+  // the provider is not configured; this prevents a fresh deployment from
+  // turning valid scheduled posts into failures before Meta is connected.
+  if (!env.META_APP_ID || !env.META_APP_SECRET || !env.META_TOKEN_ENCRYPTION_KEY) {
+    return { processed: 0, published: 0, failed: 0 }
+  }
+
   const now = new Date().toISOString()
   const due = await env.DB.prepare(
     `SELECT id, user_id, content, attempts FROM posts
@@ -41,6 +48,7 @@ export async function processDuePosts(env: Env): Promise<{ processed: number; pu
 
     const publisher = createMetaPublisher(env, post.user_id)
     let destinationFailures = 0
+    let destinationAttempts = 0
 
     for (const destination of destinations.results) {
       const claimDestination = await env.DB.prepare(
@@ -48,6 +56,7 @@ export async function processDuePosts(env: Env): Promise<{ processed: number; pu
          WHERE post_id=? AND destination_id=? AND status IN ('pending','failed')`,
       ).bind(now, post.id, destination.id).run()
       if (!claimDestination.meta.changes) continue
+      destinationAttempts++
 
       try {
         const result = await publisher.publish({ destinationId: destination.id, message: post.content })
@@ -79,9 +88,19 @@ export async function processDuePosts(env: Env): Promise<{ processed: number; pu
       continue
     }
 
+    // A concurrent worker may have claimed all destinations. Leave the post in
+    // processing only when another worker is genuinely active; normally this
+    // branch is reached after at least one destination attempt in this run.
+    if (!destinationAttempts) {
+      await env.DB.prepare(`UPDATE posts SET status='scheduled',updated_at=? WHERE id=? AND status='processing'`).bind(now, post.id).run()
+      continue
+    }
+
     const attempts = Number(post.attempts) + 1
-    if (!destinationFailures || attempts >= MAX_ATTEMPTS) {
-      const message = attempts >= MAX_ATTEMPTS ? 'Se alcanzó el máximo de intentos de publicación.' : 'Quedaron destinos pendientes de publicación.'
+    if (attempts >= MAX_ATTEMPTS) {
+      const message = destinationFailures
+        ? 'Se alcanzó el máximo de intentos de publicación.'
+        : 'La publicación no pudo completar todos sus destinos.'
       await env.DB.prepare(`UPDATE posts SET status='failed',attempts=?,next_attempt_at=NULL,error_message=?,updated_at=? WHERE id=?`).bind(attempts, message, now, post.id).run()
       failed++
     } else {
