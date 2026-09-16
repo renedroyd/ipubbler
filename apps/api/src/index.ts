@@ -6,7 +6,7 @@ import { processDuePosts } from './scheduler'
 import type { AppEnv, PostStatus } from './types'
 
 const app = new Hono<AppEnv>()
-app.use('/api/*', cors({ origin: '*', credentials: true }))
+app.use('/api/*', cors({ origin: (origin) => origin || '*', credentials: true }))
 
 app.get('/api/health', (c) => c.json({ ok: true, service: 'ipubbler-api', version: '0.1.0', timestamp: new Date().toISOString() }))
 app.get('/api', (c) => c.json({ name: 'ipubbler', status: 'online' }))
@@ -55,6 +55,7 @@ app.post('/api/posts', async (c) => {
   const user = c.get('user'); const body = await c.req.json<{ content?: string; scheduled_at?: string | null; timezone?: string }>(); const content = body.content?.trim() ?? ''; const scheduledAt = body.scheduled_at ?? null
   if (!content) return c.json({ error: 'El contenido no puede estar vacío' }, 400)
   if (scheduledAt && Number.isNaN(Date.parse(scheduledAt))) return c.json({ error: 'scheduled_at inválido' }, 400)
+  if (scheduledAt && Date.parse(scheduledAt) <= Date.now()) return c.json({ error: 'La fecha programada debe estar en el futuro' }, 400)
   const now = new Date().toISOString(); const post = { id: crypto.randomUUID(), user_id: user.id, content, status: scheduledAt ? 'scheduled' : 'draft' as PostStatus, scheduled_at: scheduledAt, timezone: body.timezone || 'UTC', published_at: null, attempts: 0, next_attempt_at: null, error_message: null, created_at: now, updated_at: now }
   await c.env.DB.prepare('INSERT INTO posts (id,user_id,content,status,scheduled_at,timezone,published_at,attempts,next_attempt_at,error_message,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)').bind(post.id,post.user_id,post.content,post.status,post.scheduled_at,post.timezone,post.published_at,post.attempts,post.next_attempt_at,post.error_message,post.created_at,post.updated_at).run()
   return c.json({ post }, 201)
@@ -68,14 +69,43 @@ app.patch('/api/posts/:id', async (c) => {
   const user = c.get('user'); const id = c.req.param('id'); const current = await c.env.DB.prepare('SELECT * FROM posts WHERE id=? AND user_id=?').bind(id,user.id).first<Record<string,unknown>>()
   if (!current) return c.json({ error: 'Publicación no encontrada' }, 404); if (current.status === 'processing') return c.json({ error: 'La publicación está siendo procesada' }, 409)
   const body = await c.req.json<{ content?: string; scheduled_at?: string | null; timezone?: string }>(); const content = body.content !== undefined ? body.content.trim() : String(current.content); const scheduledAt = body.scheduled_at !== undefined ? body.scheduled_at : current.scheduled_at
-  if (!content) return c.json({ error: 'El contenido no puede estar vacío' }, 400); if (scheduledAt && Number.isNaN(Date.parse(String(scheduledAt)))) return c.json({ error: 'scheduled_at inválido' }, 400)
+  if (!content) return c.json({ error: 'El contenido no puede estar vacío' }, 400); if (scheduledAt && Number.isNaN(Date.parse(String(scheduledAt)))) return c.json({ error: 'scheduled_at inválido' }, 400); if (scheduledAt && Date.parse(String(scheduledAt)) <= Date.now()) return c.json({ error: 'La fecha programada debe estar en el futuro' }, 400)
   const now = new Date().toISOString(); const status: PostStatus = scheduledAt ? 'scheduled' : 'draft'
-  await c.env.DB.prepare('UPDATE posts SET content=?,status=?,scheduled_at=?,timezone=?,error_message=NULL,updated_at=? WHERE id=? AND user_id=?').bind(content,status,scheduledAt,body.timezone ?? current.timezone,now,id,user.id).run()
+  await c.env.DB.prepare('UPDATE posts SET content=?,status=?,scheduled_at=?,timezone=?,attempts=0,next_attempt_at=NULL,error_message=NULL,updated_at=? WHERE id=? AND user_id=?').bind(content,status,scheduledAt,body.timezone ?? current.timezone,now,id,user.id).run()
   return c.json({ post: await c.env.DB.prepare('SELECT * FROM posts WHERE id=? AND user_id=?').bind(id,user.id).first() })
 })
 
 app.delete('/api/posts/:id', async (c) => { const result = await c.env.DB.prepare('DELETE FROM posts WHERE id=? AND user_id=?').bind(c.req.param('id'),c.get('user').id).run(); if (!result.meta.changes) return c.json({ error:'Publicación no encontrada' },404); return c.json({ ok:true }) })
 app.post('/api/posts/:id/media', async (c) => uploadMedia(c, c.req.param('id')))
+
+app.get('/api/posts/:id/media', async (c) => {
+  const rows = await c.env.DB.prepare(
+    'SELECT m.id,m.post_id,m.filename,m.mime_type,m.size,m.sort_order,m.created_at FROM media m JOIN posts p ON p.id=m.post_id WHERE m.post_id=? AND p.user_id=? ORDER BY m.sort_order ASC, m.created_at ASC',
+  ).bind(c.req.param('id'), c.get('user').id).all()
+  return c.json({ media: rows.results })
+})
+
+app.get('/api/posts/:id/logs', async (c) => {
+  const post = await c.env.DB.prepare('SELECT id FROM posts WHERE id=? AND user_id=?').bind(c.req.param('id'), c.get('user').id).first()
+  if (!post) return c.json({ error: 'Publicación no encontrada' }, 404)
+  const logs = await c.env.DB.prepare('SELECT id,post_id,status,message,created_at FROM publication_logs WHERE post_id=? ORDER BY created_at DESC').bind(c.req.param('id')).all()
+  return c.json({ logs: logs.results })
+})
+
+app.get('/api/media/:id', async (c) => {
+  const media = await c.env.DB.prepare(
+    'SELECT m.id,m.r2_key,m.filename,m.mime_type,m.size FROM media m JOIN posts p ON p.id=m.post_id WHERE m.id=? AND p.user_id=?',
+  ).bind(c.req.param('id'), c.get('user').id).first<{ id:string; r2_key:string; filename:string; mime_type:string; size:number }>()
+  if (!media) return c.json({ error: 'Multimedia no encontrada' }, 404)
+  const object = await c.env.MEDIA_BUCKET.get(media.r2_key)
+  if (!object) return c.json({ error: 'Archivo no encontrado' }, 404)
+  const headers = new Headers()
+  object.writeHttpMetadata(headers)
+  headers.set('etag', object.httpEtag)
+  headers.set('content-disposition', `inline; filename="${media.filename}"`)
+  return new Response(object.body, { headers })
+})
+
 app.delete('/api/media/:id', async (c) => deleteMedia(c, c.req.param('id')))
 
 app.get('/api/dashboard/stats', async (c) => {
