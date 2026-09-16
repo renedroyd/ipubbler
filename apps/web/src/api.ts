@@ -15,6 +15,7 @@ export interface Media { id: string; post_id: string; filename: string; mime_typ
 export interface PublicationLog { id: string; post_id: string; status: string; message: string | null; created_at: string }
 export interface Destination { id: string; type: 'page' | 'profile' | 'group' | string; provider_id: string; name: string; metadata_json?: string | null; status?: string; provider_post_id?: string | null; error_message?: string | null; published_at?: string | null }
 export interface MetaAccount { id: string; provider_user_id: string; name: string; token_expires_at?: string | null; created_at?: string; updated_at?: string }
+export interface CalendarPost extends Post { destination_count?: number }
 
 export const api = {
   me: () => request<{ user: User | null }>('/api/auth/me'),
