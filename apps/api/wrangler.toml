@@ -2,16 +2,18 @@ name = "ipubbler-api"
 main = "src/index.ts"
 compatibility_date = "2026-09-16"
 
-# D1 and R2 bindings will be added during the infrastructure step.
-# Example:
-# [[d1_databases]]
-# binding = "DB"
-# database_name = "ipubbler-db"
-# database_id = "YOUR_DATABASE_ID"
-#
-# [[r2_buckets]]
-# binding = "MEDIA_BUCKET"
-# bucket_name = "ipubbler-media"
+# Create these resources with Wrangler before deploying:
+#   npx wrangler d1 create ipubbler-db
+#   npx wrangler r2 bucket create ipubbler-media
+# Then replace the placeholders below with the returned D1 database_id.
+[[d1_databases]]
+binding = "DB"
+database_name = "ipubbler-db"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+
+[[r2_buckets]]
+binding = "MEDIA_BUCKET"
+bucket_name = "ipubbler-media"
 
 [triggers]
 crons = ["* * * * *"]
