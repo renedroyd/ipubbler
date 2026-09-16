@@ -1,5 +1,6 @@
 import type { Context } from 'hono'
-import type { Env, SessionUser } from './types'
+import type { MiddlewareHandler } from 'hono'
+import type { AppEnv, SessionUser } from './types'
 
 const SESSION_DAYS = 7
 
@@ -20,20 +21,9 @@ function randomToken(bytes = 32): string {
   return bytesToBase64(data).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
 }
 
-async function digest(value: string): Promise<string> {
+export async function digest(value: string): Promise<string> {
   const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value))
   return bytesToBase64(new Uint8Array(hash))
-}
-
-async function derivePasswordKey(password: string, salt: Uint8Array): Promise<CryptoKey> {
-  const material = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits'])
-  return crypto.subtle.deriveKey(
-    { name: 'PBKDF2', salt, iterations: 210_000, hash: 'SHA-256' },
-    material,
-    { name: 'AES-GCM', length: 256 },
-    true,
-    ['encrypt', 'decrypt'],
-  )
 }
 
 export async function hashPassword(password: string): Promise<string> {
@@ -82,15 +72,15 @@ function sessionCookie(token: string, maxAge: number): string {
   return `ipubbler_session=${token}; Max-Age=${maxAge}; Path=/; HttpOnly; Secure; SameSite=Lax`
 }
 
-export function setSessionCookie(c: Context<Env>, token: string): void {
+export function setSessionCookie(c: Context<AppEnv>, token: string): void {
   c.header('Set-Cookie', sessionCookie(token, SESSION_DAYS * 24 * 60 * 60))
 }
 
-export function clearSessionCookie(c: Context<Env>): void {
+export function clearSessionCookie(c: Context<AppEnv>): void {
   c.header('Set-Cookie', sessionCookie('', 0))
 }
 
-export async function getSessionUser(c: Context<Env>): Promise<SessionUser | null> {
+export async function getSessionUser(c: Context<AppEnv>): Promise<SessionUser | null> {
   const cookie = c.req.header('Cookie') ?? ''
   const match = cookie.match(/(?:^|;\s*)ipubbler_session=([^;]+)/)
   if (!match) return null
@@ -103,11 +93,9 @@ export async function getSessionUser(c: Context<Env>): Promise<SessionUser | nul
   return row ?? null
 }
 
-export async function requireAuth(c: Context<Env>, next: () => Promise<void>): Promise<Response | void> {
+export const requireAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
   const user = await getSessionUser(c)
   if (!user) return c.json({ error: 'No autenticado' }, 401)
   c.set('user', user)
   await next()
 }
-
-export { digest }
