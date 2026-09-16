@@ -1,16 +1,160 @@
 import { Hono } from 'hono'
+import { cors } from 'hono/cors'
+import {
+  clearSessionCookie,
+  createSession,
+  getSessionUser,
+  hashPassword,
+  requireAuth,
+  setSessionCookie,
+  verifyPassword,
+  digest,
+} from './auth'
+import type { AppEnv, PostStatus } from './types'
 
-const app = new Hono()
+const app = new Hono<AppEnv>()
 
-app.get('/api/health', (c) => {
-  return c.json({
-    ok: true,
-    service: 'ipubbler-api',
-    version: '0.1.0',
-    timestamp: new Date().toISOString(),
-  })
-})
+app.use('/api/*', cors({ origin: '*', credentials: true }))
+
+app.get('/api/health', (c) => c.json({
+  ok: true,
+  service: 'ipubbler-api',
+  version: '0.1.0',
+  timestamp: new Date().toISOString(),
+}))
 
 app.get('/api', (c) => c.json({ name: 'ipubbler', status: 'online' }))
+
+app.post('/api/setup', async (c) => {
+  const setupSecret = c.req.header('X-Setup-Secret')
+  if (!c.env.SETUP_SECRET || setupSecret !== c.env.SETUP_SECRET) return c.json({ error: 'No autorizado' }, 403)
+  const existing = await c.env.DB.prepare('SELECT id FROM users LIMIT 1').first()
+  if (existing) return c.json({ error: 'El administrador ya fue creado' }, 409)
+  const body = await c.req.json<{ email?: string; password?: string; name?: string }>()
+  const email = body.email?.trim().toLowerCase()
+  const password = body.password ?? ''
+  if (!email || !email.includes('@') || password.length < 10) {
+    return c.json({ error: 'Email válido y contraseña de al menos 10 caracteres requeridos' }, 400)
+  }
+  const now = new Date().toISOString()
+  const user = { id: crypto.randomUUID(), email, name: body.name?.trim() || 'Administrador' }
+  await c.env.DB.prepare(
+    'INSERT INTO users (id, email, password_hash, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+  ).bind(user.id, user.email, await hashPassword(password), user.name, now, now).run()
+  return c.json({ ok: true, user }, 201)
+})
+
+app.post('/api/auth/login', async (c) => {
+  const body = await c.req.json<{ email?: string; password?: string }>()
+  const email = body.email?.trim().toLowerCase()
+  if (!email || !body.password) return c.json({ error: 'Credenciales requeridas' }, 400)
+  const user = await c.env.DB.prepare(
+    'SELECT id, email, name, password_hash FROM users WHERE email = ?',
+  ).bind(email).first<{ id: string; email: string; name: string; password_hash: string }>()
+  if (!user || !(await verifyPassword(body.password, user.password_hash))) {
+    return c.json({ error: 'Credenciales inválidas' }, 401)
+  }
+  const sessionUser = { id: user.id, email: user.email, name: user.name }
+  const token = await createSession(c.env.DB, sessionUser)
+  setSessionCookie(c, token)
+  return c.json({ user: sessionUser })
+})
+
+app.post('/api/auth/logout', async (c) => {
+  const cookie = c.req.header('Cookie') ?? ''
+  const match = cookie.match(/(?:^|;\s*)ipubbler_session=([^;]+)/)
+  if (match) await c.env.DB.prepare('DELETE FROM sessions WHERE token_hash = ?').bind(await digest(match[1])).run()
+  clearSessionCookie(c)
+  return c.json({ ok: true })
+})
+
+app.get('/api/auth/me', async (c) => {
+  const user = await getSessionUser(c)
+  if (!user) return c.json({ user: null }, 200)
+  return c.json({ user })
+})
+
+app.use('/api/posts/*', requireAuth)
+app.use('/api/posts', requireAuth)
+
+app.get('/api/posts', async (c) => {
+  const user = c.get('user')
+  const status = c.req.query('status') as PostStatus | undefined
+  const limit = Math.min(Math.max(Number(c.req.query('limit') ?? 50), 1), 100)
+  const params: unknown[] = [user.id]
+  let sql = 'SELECT * FROM posts WHERE user_id = ?'
+  if (status && ['draft', 'scheduled', 'processing', 'published', 'failed'].includes(status)) {
+    sql += ' AND status = ?'
+    params.push(status)
+  }
+  sql += ' ORDER BY COALESCE(scheduled_at, created_at) DESC LIMIT ?'
+  params.push(limit)
+  const result = await c.env.DB.prepare(sql).bind(...params).all()
+  return c.json({ posts: result.results })
+})
+
+app.post('/api/posts', async (c) => {
+  const user = c.get('user')
+  const body = await c.req.json<{ content?: string; scheduled_at?: string | null; timezone?: string }>()
+  const content = body.content?.trim() ?? ''
+  const scheduledAt = body.scheduled_at ?? null
+  const status: PostStatus = scheduledAt ? 'scheduled' : 'draft'
+  if (!content) return c.json({ error: 'El contenido no puede estar vacío' }, 400)
+  if (scheduledAt && Number.isNaN(Date.parse(scheduledAt))) return c.json({ error: 'scheduled_at inválido' }, 400)
+  const now = new Date().toISOString()
+  const post = {
+    id: crypto.randomUUID(), user_id: user.id, content, status,
+    scheduled_at: scheduledAt, timezone: body.timezone || 'UTC',
+    published_at: null, attempts: 0, next_attempt_at: null, error_message: null,
+    created_at: now, updated_at: now,
+  }
+  await c.env.DB.prepare(
+    `INSERT INTO posts (id,user_id,content,status,scheduled_at,timezone,published_at,attempts,next_attempt_at,error_message,created_at,updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+  ).bind(post.id, post.user_id, post.content, post.status, post.scheduled_at, post.timezone, post.published_at, post.attempts, post.next_attempt_at, post.error_message, post.created_at, post.updated_at).run()
+  return c.json({ post }, 201)
+})
+
+app.get('/api/posts/:id', async (c) => {
+  const user = c.get('user')
+  const post = await c.env.DB.prepare('SELECT * FROM posts WHERE id = ? AND user_id = ?').bind(c.req.param('id'), user.id).first()
+  if (!post) return c.json({ error: 'Publicación no encontrada' }, 404)
+  return c.json({ post })
+})
+
+app.patch('/api/posts/:id', async (c) => {
+  const user = c.get('user')
+  const body = await c.req.json<{ content?: string; scheduled_at?: string | null; timezone?: string; status?: PostStatus }>()
+  const current = await c.env.DB.prepare('SELECT * FROM posts WHERE id = ? AND user_id = ?').bind(c.req.param('id'), user.id).first<Record<string, unknown>>()
+  if (!current) return c.json({ error: 'Publicación no encontrada' }, 404)
+  if (current.status === 'processing') return c.json({ error: 'La publicación está siendo procesada' }, 409)
+  const content = body.content !== undefined ? body.content.trim() : String(current.content)
+  const scheduledAt = body.scheduled_at !== undefined ? body.scheduled_at : (current.scheduled_at as string | null)
+  if (!content) return c.json({ error: 'El contenido no puede estar vacío' }, 400)
+  if (scheduledAt && Number.isNaN(Date.parse(scheduledAt))) return c.json({ error: 'scheduled_at inválido' }, 400)
+  const status: PostStatus = body.status === 'failed' ? 'failed' : scheduledAt ? 'scheduled' : 'draft'
+  const now = new Date().toISOString()
+  await c.env.DB.prepare(
+    `UPDATE posts SET content=?, status=?, scheduled_at=?, timezone=?, error_message=NULL, updated_at=? WHERE id=? AND user_id=?`,
+  ).bind(content, status, scheduledAt, body.timezone ?? current.timezone, now, c.req.param('id'), user.id).run()
+  const post = await c.env.DB.prepare('SELECT * FROM posts WHERE id = ? AND user_id = ?').bind(c.req.param('id'), user.id).first()
+  return c.json({ post })
+})
+
+app.delete('/api/posts/:id', async (c) => {
+  const user = c.get('user')
+  const result = await c.env.DB.prepare('DELETE FROM posts WHERE id = ? AND user_id = ?').bind(c.req.param('id'), user.id).run()
+  if (!result.meta.changes) return c.json({ error: 'Publicación no encontrada' }, 404)
+  return c.json({ ok: true })
+})
+
+app.get('/api/dashboard/stats', async (c) => {
+  const user = await getSessionUser(c)
+  if (!user) return c.json({ error: 'No autenticado' }, 401)
+  const rows = await c.env.DB.prepare('SELECT status, COUNT(*) AS count FROM posts WHERE user_id = ? GROUP BY status').bind(user.id).all<{ status: string; count: number }>()
+  const stats = { scheduled: 0, published: 0, draft: 0, failed: 0, processing: 0 }
+  for (const row of rows.results) if (row.status in stats) stats[row.status as keyof typeof stats] = Number(row.count)
+  return c.json({ stats })
+})
 
 export default app
