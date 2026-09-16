@@ -4,6 +4,11 @@ export interface Env {
   SESSION_SECRET: string
   SETUP_SECRET?: string
   META_ACCESS_TOKEN?: string
+  META_APP_ID?: string
+  META_APP_SECRET?: string
+  META_TOKEN_ENCRYPTION_KEY?: string
+  META_GRAPH_VERSION?: string
+  META_REDIRECT_URI?: string
 }
 
 export interface SessionUser { id: string; email: string; name: string }
@@ -15,5 +20,7 @@ export interface Post {
   attempts: number; next_attempt_at: string | null; error_message: string | null
   created_at: string; updated_at: string
 }
+
+export type DestinationType = 'page' | 'profile' | 'group'
 
 export type AppEnv = { Bindings: Env; Variables: { user: SessionUser } }
