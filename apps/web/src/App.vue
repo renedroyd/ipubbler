@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
-import { api, type Post, type User } from './api'
+import { computed, onMounted, ref } from 'vue'
+import { api, type Media, type Post, type PublicationLog, type User } from './api'
 
 const user = ref<User | null>(null)
 const loading = ref(true)
+const saving = ref(false)
 const loginError = ref('')
 const email = ref('')
 const password = ref('')
@@ -12,7 +13,16 @@ const scheduledAt = ref('')
 const posts = ref<Post[]>([])
 const stats = ref({ scheduled: 0, published: 0, draft: 0, failed: 0, processing: 0 })
 const view = ref('dashboard')
+const editingId = ref<string | null>(null)
+const selectedPostId = ref<string | null>(null)
+const media = ref<Media[]>([])
+const logs = ref<PublicationLog[]>([])
+const selectedFiles = ref<File[]>([])
+const uploadError = ref('')
 const menu = [{ id: 'dashboard', label: 'Dashboard', icon: '⌂' }, { id: 'posts', label: 'Publicaciones', icon: '▣' }, { id: 'calendar', label: 'Calendario', icon: '□' }, { id: 'media', label: 'Multimedia', icon: '◈' }, { id: 'history', label: 'Historial', icon: '↺' }]
+
+const selectedPost = computed(() => posts.value.find(p => p.id === selectedPostId.value) ?? null)
+const imagePosts = computed(() => posts.value.filter(p => p.content))
 
 async function loadData() {
   const me = await api.me(); user.value = me.user
@@ -27,11 +37,46 @@ async function login() {
   finally { loading.value = false }
 }
 async function logout() { await api.logout(); user.value = null }
-async function savePost() {
-  try { await api.createPost(content.value, scheduledAt.value ? new Date(scheduledAt.value).toISOString() : null, Intl.DateTimeFormat().resolvedOptions().timeZone); content.value = ''; scheduledAt.value = ''; await loadData() }
-  catch (e) { alert(e instanceof Error ? e.message : 'No fue posible guardar') }
+function resetComposer() { editingId.value = null; content.value = ''; scheduledAt.value = ''; selectedFiles.value = []; uploadError.value = '' }
+function editPost(post: Post) {
+  editingId.value = post.id; content.value = post.content; scheduledAt.value = post.scheduled_at ? toLocalInput(post.scheduled_at) : ''; selectedFiles.value = []; uploadError.value = ''; view.value = 'posts'; window.scrollTo({ top: 0, behavior: 'smooth' })
 }
-async function removePost(id: string) { if (!confirm('¿Eliminar esta publicación?')) return; await api.deletePost(id); await loadData() }
+function toLocalInput(iso: string) {
+  const d = new Date(iso); const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+function handleFiles(event: Event) {
+  const input = event.target as HTMLInputElement
+  selectedFiles.value = Array.from(input.files ?? [])
+  uploadError.value = ''
+}
+async function uploadForPost(postId: string) {
+  for (const file of selectedFiles.value) await api.uploadMedia(postId, file)
+  selectedFiles.value = []
+  media.value = (await api.media(postId)).media
+}
+async function savePost() {
+  if (!content.value.trim()) return
+  saving.value = true; uploadError.value = ''
+  try {
+    const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone
+    const iso = scheduledAt.value ? new Date(scheduledAt.value).toISOString() : null
+    let post: Post
+    if (editingId.value) post = (await api.updatePost(editingId.value, { content: content.value, scheduled_at: iso, timezone })).post
+    else post = (await api.createPost(content.value, iso, timezone)).post
+    if (selectedFiles.value.length) await uploadForPost(post.id)
+    resetComposer(); await loadData()
+  } catch (e) { uploadError.value = e instanceof Error ? e.message : 'No fue posible guardar la publicación' }
+  finally { saving.value = false }
+}
+async function removePost(id: string) { if (!confirm('¿Eliminar esta publicación y sus imágenes?')) return; await api.deletePost(id); if (selectedPostId.value === id) selectedPostId.value = null; await loadData() }
+async function openPost(post: Post) {
+  selectedPostId.value = post.id
+  const [mediaData, logData] = await Promise.all([api.media(post.id), api.logs(post.id)])
+  media.value = mediaData.media; logs.value = logData.logs
+}
+async function removeMedia(id: string) { await api.deleteMedia(id); if (selectedPostId.value) media.value = (await api.media(selectedPostId.value)).media }
+async function refreshLogs() { if (selectedPostId.value) logs.value = (await api.logs(selectedPostId.value)).logs }
 onMounted(async () => { try { await loadData() } catch { user.value = null } finally { loading.value = false } })
 </script>
 
@@ -41,9 +86,14 @@ onMounted(async () => { try { await loadData() } catch { user.value = null } fin
   <div v-else class="app-shell">
     <aside class="sidebar"><div class="brand"><span class="brand-mark">i</span><span>ipubbler</span></div><nav><button v-for="item in menu" :key="item.id" :class="['nav-item', { active: view === item.id }]" @click="view = item.id"><span>{{ item.icon }}</span>{{ item.label }}</button></nav><div class="sidebar-footer"><strong>{{ user.name }}</strong><button @click="logout">Cerrar sesión</button></div></aside>
     <main class="main"><header class="topbar"><div><p class="eyebrow">PUBLICADOR SOCIAL</p><h1>{{ menu.find(m => m.id === view)?.label }}</h1></div><button class="avatar">{{ user.name.charAt(0).toUpperCase() }}</button></header>
-      <section v-if="view === 'dashboard'" class="content"><div class="welcome"><div><h2>Tu centro de publicaciones</h2><p>Planifica y administra tu contenido desde un solo lugar.</p></div><button class="primary" @click="view = 'posts'">+ Nueva publicación</button></div><div class="stats"><article><span>Programadas</span><strong>{{ stats.scheduled }}</strong><small>pendientes</small></article><article><span>Publicadas</span><strong>{{ stats.published }}</strong><small>publicadas</small></article><article><span>Borradores</span><strong>{{ stats.draft }}</strong><small>para continuar</small></article><article><span>Fallidas</span><strong>{{ stats.failed }}</strong><small>requieren atención</small></article></div><div class="panel"><div class="panel-head"><h3>Próximas publicaciones</h3><button @click="view = 'posts'">Ver publicaciones →</button></div><div v-if="posts.filter(p => p.status === 'scheduled').length" class="post-list"><div v-for="post in posts.filter(p => p.status === 'scheduled').slice(0, 5)" :key="post.id" class="post-row"><div><strong>{{ new Date(post.scheduled_at!).toLocaleString() }}</strong><p>{{ post.content }}</p></div><span class="badge scheduled">programada</span></div></div><div v-else class="empty"><div class="empty-icon">✦</div><h3>Aún no hay publicaciones programadas</h3><p>Crea tu primera publicación y prográmala para una fecha y hora.</p><button class="secondary" @click="view = 'posts'">Crear publicación</button></div></div></section>
-      <section v-else-if="view === 'posts'" class="content"><div class="panel composer"><div class="panel-head"><h2>Nueva publicación</h2><span>Fase 1</span></div><textarea v-model="content" maxlength="5000" placeholder="¿Qué quieres publicar?"></textarea><div class="composer-footer"><label>Fecha y hora (opcional)<input v-model="scheduledAt" type="datetime-local"></label><button class="primary" @click="savePost">{{ scheduledAt ? 'Programar' : 'Guardar borrador' }}</button></div></div><div class="panel"><div class="panel-head"><h3>Mis publicaciones</h3></div><div v-if="posts.length" class="post-list"><div v-for="post in posts" :key="post.id" class="post-row"><div><span :class="['badge', post.status]">{{ post.status }}</span><p>{{ post.content }}</p><small v-if="post.scheduled_at">{{ new Date(post.scheduled_at).toLocaleString() }}</small></div><button class="danger" @click="removePost(post.id)">Eliminar</button></div></div><div v-else class="empty"><p>No tienes publicaciones todavía.</p></div></div></section>
-      <section v-else class="content"><div class="panel placeholder"><div class="empty"><div class="empty-icon">✦</div><h2>{{ menu.find(m => m.id === view)?.label }}</h2><p>Este módulo queda preparado para la siguiente iteración de la Fase 1.</p></div></div></section>
+      <section v-if="view === 'dashboard'" class="content"><div class="welcome"><div><h2>Tu centro de publicaciones</h2><p>Planifica y administra tu contenido desde un solo lugar.</p></div><button class="primary" @click="view = 'posts'; resetComposer()">+ Nueva publicación</button></div><div class="stats"><article><span>Programadas</span><strong>{{ stats.scheduled }}</strong><small>pendientes</small></article><article><span>Publicadas</span><strong>{{ stats.published }}</strong><small>publicadas</small></article><article><span>Borradores</span><strong>{{ stats.draft }}</strong><small>para continuar</small></article><article><span>Fallidas</span><strong>{{ stats.failed }}</strong><small>requieren atención</small></article></div><div class="panel"><div class="panel-head"><h3>Próximas publicaciones</h3><button @click="view = 'posts'">Ver publicaciones →</button></div><div v-if="posts.filter(p => p.status === 'scheduled').length" class="post-list"><div v-for="post in posts.filter(p => p.status === 'scheduled').slice(0, 5)" :key="post.id" class="post-row"><div><strong>{{ new Date(post.scheduled_at!).toLocaleString() }}</strong><p>{{ post.content }}</p></div><span class="badge scheduled">programada</span></div></div><div v-else class="empty"><div class="empty-icon">✦</div><h3>Aún no hay publicaciones programadas</h3><p>Crea tu primera publicación y prográmala para una fecha y hora.</p><button class="secondary" @click="view = 'posts'">Crear publicación</button></div></div></section>
+
+      <section v-else-if="view === 'posts'" class="content"><div class="panel composer"><div class="panel-head"><h2>{{ editingId ? 'Editar publicación' : 'Nueva publicación' }}</h2><span>Fase 1</span></div><textarea v-model="content" maxlength="5000" placeholder="¿Qué quieres publicar?"></textarea><div class="file-picker"><label>Imágenes <input type="file" accept="image/jpeg,image/png,image/webp,image/gif" multiple @change="handleFiles"></label><small>JPG, PNG, WebP o GIF · máximo 10 MB por imagen</small><ul v-if="selectedFiles.length"><li v-for="file in selectedFiles" :key="file.name + file.size">{{ file.name }} ({{ Math.round(file.size / 1024) }} KB)</li></ul></div><div v-if="uploadError" class="error">{{ uploadError }}</div><div class="composer-footer"><label>Fecha y hora (opcional)<input v-model="scheduledAt" type="datetime-local"></label><div class="actions"><button v-if="editingId" class="secondary" @click="resetComposer">Cancelar</button><button class="primary" :disabled="saving" @click="savePost">{{ saving ? 'Guardando…' : scheduledAt ? 'Programar' : 'Guardar borrador' }}</button></div></div></div><div class="panel"><div class="panel-head"><h3>Mis publicaciones</h3><span>{{ posts.length }}</span></div><div v-if="posts.length" class="post-list"><div v-for="post in posts" :key="post.id" class="post-row"><div><span :class="['badge', post.status]">{{ post.status }}</span><p>{{ post.content }}</p><small v-if="post.scheduled_at">{{ new Date(post.scheduled_at).toLocaleString() }}</small></div><div class="row-actions"><button class="secondary" @click="openPost(post)">Detalle</button><button class="secondary" @click="editPost(post)">Editar</button><button class="danger" @click="removePost(post.id)">Eliminar</button></div></div></div><div v-else class="empty"><p>No tienes publicaciones todavía.</p></div></div>
+        <div v-if="selectedPost" class="panel detail"><div class="panel-head"><div><h3>Detalle de publicación</h3><small>{{ selectedPost.status }} · {{ selectedPost.timezone }}</small></div><button @click="selectedPostId = null">Cerrar</button></div><p>{{ selectedPost.content }}</p><div v-if="media.length" class="media-grid"><figure v-for="item in media" :key="item.id"><img :src="api.mediaUrl(item.id)" :alt="item.filename"><figcaption><span>{{ item.filename }}</span><button class="danger" @click="removeMedia(item.id)">Eliminar</button></figcaption></figure></div><div class="logs"><div class="panel-head"><h4>Historial</h4><button @click="refreshLogs">Actualizar</button></div><div v-if="logs.length"><div v-for="log in logs" :key="log.id" class="log-row"><span :class="['badge', log.status]">{{ log.status }}</span><div><strong>{{ new Date(log.created_at).toLocaleString() }}</strong><p>{{ log.message }}</p></div></div></div><p v-else>No hay eventos registrados.</p></div></div></section>
+
+      <section v-else-if="view === 'media'" class="content"><div class="panel"><div class="panel-head"><h2>Multimedia</h2><span>{{ imagePosts.length }} publicaciones</span></div><p class="muted">Las imágenes se almacenan de forma privada en R2 y se sirven únicamente a usuarios autenticados.</p><div v-if="imagePosts.length" class="post-list"><div v-for="post in imagePosts" :key="post.id" class="post-row"><div><span :class="['badge', post.status]">{{ post.status }}</span><p>{{ post.content }}</p></div><button class="secondary" @click="openPost(post)">Ver archivos</button></div></div><div v-else class="empty"><p>No hay publicaciones con contenido todavía.</p></div></div></section>
+      <section v-else-if="view === 'history'" class="content"><div class="panel"><div class="panel-head"><h2>Historial</h2><button @click="loadData">Actualizar</button></div><div v-if="posts.length" class="post-list"><div v-for="post in posts" :key="post.id" class="post-row"><div><span :class="['badge', post.status]">{{ post.status }}</span><p>{{ post.content }}</p><small v-if="post.error_message">{{ post.error_message }}</small></div><button class="secondary" @click="openPost(post)">Ver historial</button></div></div><div v-else class="empty"><p>No hay publicaciones.</p></div></div></section>
+      <section v-else class="content"><div class="panel placeholder"><div class="empty"><div class="empty-icon">✦</div><h2>Calendario</h2><p>El calendario visual será el siguiente módulo. La programación ya está disponible desde el editor.</p><button class="secondary" @click="view = 'posts'">Ir a publicaciones</button></div></div></section>
     </main>
   </div>
 </template>
