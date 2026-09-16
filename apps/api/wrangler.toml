@@ -1,0 +1,17 @@
+name = "ipubbler-api"
+main = "src/index.ts"
+compatibility_date = "2026-09-16"
+
+# D1 and R2 bindings will be added during the infrastructure step.
+# Example:
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "ipubbler-db"
+# database_id = "YOUR_DATABASE_ID"
+#
+# [[r2_buckets]]
+# binding = "MEDIA_BUCKET"
+# bucket_name = "ipubbler-media"
+
+[triggers]
+crons = ["* * * * *"]
