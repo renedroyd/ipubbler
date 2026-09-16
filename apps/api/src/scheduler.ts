@@ -1,39 +1,95 @@
+import { createMetaPublisher } from './meta/publisher'
 import type { Env } from './types'
 
-export async function processDuePosts(env: Env): Promise<{ processed: number; published: number; failed: number }> {
-  // Phase 1 intentionally does not consume scheduled posts until a social
-  // provider is configured. This prevents the scheduler from falsely marking
-  // content as published or failed while Meta integration is still pending.
-  if (!env.META_ACCESS_TOKEN) return { processed: 0, published: 0, failed: 0 }
+const MAX_ATTEMPTS = 5
 
+export async function processDuePosts(env: Env): Promise<{ processed: number; published: number; failed: number }> {
   const now = new Date().toISOString()
   const due = await env.DB.prepare(
-    `SELECT id, content, attempts FROM posts
+    `SELECT id, user_id, content, attempts FROM posts
      WHERE status = 'scheduled' AND scheduled_at IS NOT NULL
        AND scheduled_at <= ?
        AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
      ORDER BY scheduled_at ASC LIMIT 25`,
-  ).bind(now, now).all<{ id: string; content: string; attempts: number }>()
+  ).bind(now, now).all<{ id: string; user_id: string; content: string; attempts: number }>()
 
   let published = 0
   let failed = 0
+
   for (const post of due.results) {
     const claim = await env.DB.prepare(
       `UPDATE posts SET status='processing', updated_at=? WHERE id=? AND status='scheduled'`,
     ).bind(now, post.id).run()
     if (!claim.meta.changes) continue
 
-    try {
-      // Meta publication adapter will replace this section in phase 2.
-      const attempts = Number(post.attempts) + 1
-      const retryAt = new Date(Date.now() + Math.min(60 * 2 ** attempts, 3600) * 1000).toISOString()
-      const message = 'Proveedor social detectado, pero el adaptador Meta aún no está implementado.'
-      await env.DB.prepare('UPDATE posts SET status=?,attempts=?,next_attempt_at=?,error_message=?,updated_at=? WHERE id=?').bind('scheduled', attempts, retryAt, message, now, post.id).run()
-      await env.DB.prepare('INSERT INTO publication_logs (id,post_id,status,message,created_at) VALUES (?,?,?,?,?)').bind(crypto.randomUUID(), post.id, 'scheduled', message, now).run()
-    } catch (error) {
+    const destinations = await env.DB.prepare(`
+      SELECT d.id
+      FROM post_destinations pd
+      JOIN destinations d ON d.id=pd.destination_id
+      JOIN facebook_accounts a ON a.id=d.facebook_account_id
+      WHERE pd.post_id=? AND a.user_id=?
+      ORDER BY d.name
+    `).bind(post.id, post.user_id).all<{ id: string }>()
+
+    if (!destinations.results.length) {
+      const message = 'La publicación no tiene destinos configurados.'
+      await env.DB.prepare(`UPDATE posts SET status='failed',error_message=?,updated_at=? WHERE id=?`).bind(message, now, post.id).run()
+      await env.DB.prepare('INSERT INTO publication_logs (id,post_id,status,message,created_at) VALUES (?,?,?,?,?)').bind(crypto.randomUUID(), post.id, 'failed', message, now).run()
       failed++
-      await env.DB.prepare("UPDATE posts SET status='failed',error_message=?,updated_at=? WHERE id=?").bind(String(error), now, post.id).run()
+      continue
+    }
+
+    const publisher = createMetaPublisher(env, post.user_id)
+    let destinationFailures = 0
+
+    for (const destination of destinations.results) {
+      const claimDestination = await env.DB.prepare(
+        `UPDATE post_destinations SET status='processing',error_message=NULL,updated_at=?
+         WHERE post_id=? AND destination_id=? AND status IN ('pending','failed')`,
+      ).bind(now, post.id, destination.id).run()
+      if (!claimDestination.meta.changes) continue
+
+      try {
+        const result = await publisher.publish({ destinationId: destination.id, message: post.content })
+        await env.DB.prepare(
+          `UPDATE post_destinations SET status='published',provider_post_id=?,published_at=?,updated_at=? WHERE post_id=? AND destination_id=?`,
+        ).bind(result.providerId, now, now, post.id, destination.id).run()
+        await env.DB.prepare(
+          'INSERT INTO publication_logs (id,post_id,status,message,created_at) VALUES (?,?,?,?,?)',
+        ).bind(crypto.randomUUID(), post.id, 'published', `Publicado en destino ${destination.id}`, now).run()
+      } catch (error) {
+        destinationFailures++
+        const message = error instanceof Error ? error.message : String(error)
+        await env.DB.prepare(
+          `UPDATE post_destinations SET status='failed',error_message=?,updated_at=? WHERE post_id=? AND destination_id=?`,
+        ).bind(message, now, post.id, destination.id).run()
+        await env.DB.prepare(
+          'INSERT INTO publication_logs (id,post_id,status,message,created_at) VALUES (?,?,?,?,?)',
+        ).bind(crypto.randomUUID(), post.id, 'failed', message, now).run()
+      }
+    }
+
+    const remaining = await env.DB.prepare(
+      `SELECT COUNT(*) AS count FROM post_destinations WHERE post_id=? AND status!='published'`,
+    ).bind(post.id).first<{ count: number }>()
+
+    if (!Number(remaining?.count)) {
+      await env.DB.prepare(`UPDATE posts SET status='published',published_at=?,next_attempt_at=NULL,error_message=NULL,updated_at=? WHERE id=?`).bind(now, now, post.id).run()
+      published++
+      continue
+    }
+
+    const attempts = Number(post.attempts) + 1
+    if (!destinationFailures || attempts >= MAX_ATTEMPTS) {
+      const message = attempts >= MAX_ATTEMPTS ? 'Se alcanzó el máximo de intentos de publicación.' : 'Quedaron destinos pendientes de publicación.'
+      await env.DB.prepare(`UPDATE posts SET status='failed',attempts=?,next_attempt_at=NULL,error_message=?,updated_at=? WHERE id=?`).bind(attempts, message, now, post.id).run()
+      failed++
+    } else {
+      const delaySeconds = Math.min(60 * 2 ** attempts, 3600)
+      const retryAt = new Date(Date.now() + delaySeconds * 1000).toISOString()
+      await env.DB.prepare(`UPDATE posts SET status='scheduled',attempts=?,next_attempt_at=?,error_message=?,updated_at=? WHERE id=?`).bind(attempts, retryAt, 'Una o más publicaciones no pudieron completarse; se reintentará automáticamente.', now, post.id).run()
     }
   }
+
   return { processed: due.results.length, published, failed }
 }
