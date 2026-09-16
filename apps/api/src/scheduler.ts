@@ -38,6 +38,11 @@ export async function processDuePosts(env: Env): Promise<{ processed: number; pu
       ORDER BY d.name
     `).bind(post.id, post.user_id).all<{ id: string }>()
 
+    const mediaRows = await env.DB.prepare(
+      'SELECT r2_key FROM media WHERE post_id=? ORDER BY sort_order ASC',
+    ).bind(post.id).all<{ r2_key: string }>()
+    const mediaKeys = mediaRows.results.map(item => item.r2_key)
+
     if (!destinations.results.length) {
       const message = 'La publicación no tiene destinos configurados.'
       await env.DB.prepare(`UPDATE posts SET status='failed',error_message=?,updated_at=? WHERE id=?`).bind(message, now, post.id).run()
@@ -59,7 +64,7 @@ export async function processDuePosts(env: Env): Promise<{ processed: number; pu
       destinationAttempts++
 
       try {
-        const result = await publisher.publish({ destinationId: destination.id, message: post.content })
+        const result = await publisher.publish({ destinationId: destination.id, message: post.content, mediaKeys })
         await env.DB.prepare(
           `UPDATE post_destinations SET status='published',provider_post_id=?,published_at=?,updated_at=? WHERE post_id=? AND destination_id=?`,
         ).bind(result.providerId, now, now, post.id, destination.id).run()
@@ -88,9 +93,6 @@ export async function processDuePosts(env: Env): Promise<{ processed: number; pu
       continue
     }
 
-    // A concurrent worker may have claimed all destinations. Leave the post in
-    // processing only when another worker is genuinely active; normally this
-    // branch is reached after at least one destination attempt in this run.
     if (!destinationAttempts) {
       await env.DB.prepare(`UPDATE posts SET status='scheduled',updated_at=? WHERE id=? AND status='processing'`).bind(now, post.id).run()
       continue
