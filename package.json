@@ -1,0 +1,13 @@
+{
+  "name": "ipubbler",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Self-hosted social media publishing platform",
+  "workspaces": ["apps/web", "apps/api"],
+  "scripts": {
+    "dev:web": "npm --workspace apps/web run dev",
+    "build:web": "npm --workspace apps/web run build",
+    "dev:api": "npm --workspace apps/api run dev",
+    "deploy:api": "npm --workspace apps/api run deploy"
+  }
+}
