@@ -3,6 +3,7 @@ export interface Env {
   MEDIA_BUCKET: R2Bucket
   SESSION_SECRET: string
   SETUP_SECRET?: string
+  META_ACCESS_TOKEN?: string
 }
 
 export interface SessionUser { id: string; email: string; name: string }
