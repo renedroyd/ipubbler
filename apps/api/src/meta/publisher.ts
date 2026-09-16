@@ -35,6 +35,12 @@ export function createMetaPublisher(env: Env, userId: string): SocialPublisher {
       if (destination.type !== 'page') throw new Error(`El destino ${destination.type} todavía no tiene un adaptador de publicación habilitado`)
       if (!destination.access_token_encrypted) throw new Error('El destino no tiene un token de acceso configurado')
 
+      // Keep media handling explicit until the Meta media-upload contract is
+      // verified and implemented. Never silently publish an image post as text.
+      if (request.mediaKeys?.length) {
+        throw new Error('La publicación multimedia para Meta Pages aún no está habilitada; la publicación de texto sí está disponible')
+      }
+
       const secret = requireMetaEncryptionSecret(env)
       const pageAccessToken = await decryptMetaToken(destination.access_token_encrypted, secret)
       const meta = new MetaClient(env)
