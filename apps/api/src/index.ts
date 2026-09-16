@@ -10,7 +10,7 @@ const app = new Hono<AppEnv>()
 
 function allowedOrigin(env: AppEnv['Bindings'], requestOrigin: string | undefined): string {
   if (env.FRONTEND_URL) return env.FRONTEND_URL.replace(/\/$/, '')
-  return requestOrigin || ''
+  return ''
 }
 
 app.use('/api/*', cors({ origin: (origin, c) => allowedOrigin(c.env, origin), credentials: true }))
@@ -53,21 +53,56 @@ app.use('/api/meta/*', requireAuth)
 app.use('/api/destinations/*', requireAuth)
 app.use('/api/destinations', requireAuth)
 
+async function normalizeDestinationIds(env: AppEnv['Bindings'], userId: string, value: unknown): Promise<string[]> {
+  if (value === undefined) return []
+  if (!Array.isArray(value)) throw new Error('destination_ids debe ser un arreglo')
+  const ids = Array.from(new Set(value.filter((id): id is string => typeof id === 'string' && id.trim().length > 0).map((id) => id.trim())))
+  if (!ids.length) return []
+  const placeholders = ids.map(() => '?').join(',')
+  const owned = await env.DB.prepare(`SELECT d.id FROM destinations d JOIN facebook_accounts a ON a.id=d.facebook_account_id WHERE a.user_id=? AND d.id IN (${placeholders})`).bind(userId, ...ids).all<{ id: string }>()
+  if (owned.results.length !== ids.length) throw new Error('Uno o más destinos no pertenecen a tu cuenta')
+  return ids
+}
+
+async function getPostDestinationIds(env: AppEnv['Bindings'], postId: string): Promise<string[]> {
+  const rows = await env.DB.prepare('SELECT destination_id FROM post_destinations WHERE post_id=? ORDER BY created_at').bind(postId).all<{ destination_id: string }>()
+  return rows.results.map((row) => row.destination_id)
+}
+
+function destinationStatements(env: AppEnv['Bindings'], postId: string, destinationIds: string[], now: string) {
+  const statements = [env.DB.prepare('DELETE FROM post_destinations WHERE post_id=?').bind(postId)]
+  for (const destinationId of destinationIds) {
+    statements.push(env.DB.prepare(`INSERT INTO post_destinations (post_id,destination_id,status,provider_post_id,error_message,published_at,created_at,updated_at) VALUES (?,?, 'pending',NULL,NULL,NULL,?,?)`).bind(postId, destinationId, now, now))
+  }
+  return statements
+}
+
 app.get('/api/posts', async (c) => {
   const user = c.get('user'); const status = c.req.query('status') as PostStatus | undefined; const limit = Math.min(Math.max(Number(c.req.query('limit') ?? 50), 1), 100)
-  const params: unknown[] = [user.id]; let sql = 'SELECT * FROM posts WHERE user_id=?'
-  if (status && ['draft','scheduled','processing','published','failed'].includes(status)) { sql += ' AND status=?'; params.push(status) }
-  sql += ' ORDER BY COALESCE(scheduled_at,created_at) DESC LIMIT ?'; params.push(limit)
+  const params: unknown[] = [user.id]; let sql = `SELECT p.*, (SELECT COUNT(*) FROM media m WHERE m.post_id=p.id) AS media_count, (SELECT COUNT(*) FROM post_destinations pd WHERE pd.post_id=p.id) AS destination_count FROM posts p WHERE p.user_id=?`
+  if (status && ['draft','scheduled','processing','published','failed'].includes(status)) { sql += ' AND p.status=?'; params.push(status) }
+  sql += ' ORDER BY COALESCE(p.scheduled_at,p.created_at) DESC LIMIT ?'; params.push(limit)
   return c.json({ posts: (await c.env.DB.prepare(sql).bind(...params).all()).results })
 })
 
 app.post('/api/posts', async (c) => {
-  const user = c.get('user'); const body = await c.req.json<{ content?: string; scheduled_at?: string | null; timezone?: string }>(); const content = body.content?.trim() ?? ''; const scheduledAt = body.scheduled_at ?? null
+  const user = c.get('user')
+  let body: { content?: string; scheduled_at?: string | null; timezone?: string; destination_ids?: unknown }
+  try { body = await c.req.json() } catch { return c.json({ error: 'JSON inválido' }, 400) }
+  const content = body.content?.trim() ?? ''; const scheduledAt = body.scheduled_at ?? null
   if (!content) return c.json({ error: 'El contenido no puede estar vacío' }, 400)
   if (scheduledAt && Number.isNaN(Date.parse(scheduledAt))) return c.json({ error: 'scheduled_at inválido' }, 400)
   if (scheduledAt && Date.parse(scheduledAt) <= Date.now()) return c.json({ error: 'La fecha programada debe estar en el futuro' }, 400)
+  let destinationIds: string[]
+  try { destinationIds = await normalizeDestinationIds(c.env, user.id, body.destination_ids) } catch (error) { return c.json({ error: error instanceof Error ? error.message : 'Destinos inválidos' }, 400) }
+  if (scheduledAt && destinationIds.length === 0) return c.json({ error: 'Una publicación programada requiere al menos un destino' }, 400)
   const now = new Date().toISOString(); const post = { id: crypto.randomUUID(), user_id: user.id, content, status: scheduledAt ? 'scheduled' : 'draft' as PostStatus, scheduled_at: scheduledAt, timezone: body.timezone || 'UTC', published_at: null, attempts: 0, next_attempt_at: null, error_message: null, created_at: now, updated_at: now }
-  await c.env.DB.prepare('INSERT INTO posts (id,user_id,content,status,scheduled_at,timezone,published_at,attempts,next_attempt_at,error_message,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)').bind(post.id,post.user_id,post.content,post.status,post.scheduled_at,post.timezone,post.published_at,post.attempts,post.next_attempt_at,post.error_message,post.created_at,post.updated_at).run()
+  try {
+    await c.env.DB.batch([
+      c.env.DB.prepare('INSERT INTO posts (id,user_id,content,status,scheduled_at,timezone,published_at,attempts,next_attempt_at,error_message,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)').bind(post.id,post.user_id,post.content,post.status,post.scheduled_at,post.timezone,post.published_at,post.attempts,post.next_attempt_at,post.error_message,post.created_at,post.updated_at),
+      ...destinationStatements(c.env, post.id, destinationIds, now).slice(1),
+    ])
+  } catch { return c.json({ error: 'No fue posible guardar la publicación' }, 500) }
   return c.json({ post }, 201)
 })
 
@@ -77,11 +112,23 @@ app.get('/api/posts/:id', async (c) => {
 
 app.patch('/api/posts/:id', async (c) => {
   const user = c.get('user'); const id = c.req.param('id'); const current = await c.env.DB.prepare('SELECT * FROM posts WHERE id=? AND user_id=?').bind(id,user.id).first<Record<string,unknown>>()
-  if (!current) return c.json({ error: 'Publicación no encontrada' }, 404); if (current.status === 'processing') return c.json({ error: 'La publicación está siendo procesada' }, 409)
-  const body = await c.req.json<{ content?: string; scheduled_at?: string | null; timezone?: string }>(); const content = body.content !== undefined ? body.content.trim() : String(current.content); const scheduledAt = body.scheduled_at !== undefined ? body.scheduled_at : current.scheduled_at
+  if (!current) return c.json({ error: 'Publicación no encontrada' }, 404); if (current.status === 'processing') return c.json({ error: 'La publicación está siendo procesada' }, 409); if (current.status === 'published') return c.json({ error: 'La publicación ya fue publicada y no puede modificarse' }, 409)
+  let body: { content?: string; scheduled_at?: string | null; timezone?: string; destination_ids?: unknown }
+  try { body = await c.req.json() } catch { return c.json({ error: 'JSON inválido' }, 400) }
+  const content = body.content !== undefined ? body.content.trim() : String(current.content); const scheduledAt = body.scheduled_at !== undefined ? body.scheduled_at : current.scheduled_at
   if (!content) return c.json({ error: 'El contenido no puede estar vacío' }, 400); if (scheduledAt && Number.isNaN(Date.parse(String(scheduledAt)))) return c.json({ error: 'scheduled_at inválido' }, 400); if (scheduledAt && Date.parse(String(scheduledAt)) <= Date.now()) return c.json({ error: 'La fecha programada debe estar en el futuro' }, 400)
+  let destinationIds: string[]
+  try {
+    destinationIds = body.destination_ids !== undefined ? await normalizeDestinationIds(c.env, user.id, body.destination_ids) : await getPostDestinationIds(c.env, id)
+  } catch (error) { return c.json({ error: error instanceof Error ? error.message : 'Destinos inválidos' }, 400) }
+  if (scheduledAt && destinationIds.length === 0) return c.json({ error: 'Una publicación programada requiere al menos un destino' }, 400)
   const now = new Date().toISOString(); const status: PostStatus = scheduledAt ? 'scheduled' : 'draft'
-  await c.env.DB.prepare('UPDATE posts SET content=?,status=?,scheduled_at=?,timezone=?,attempts=0,next_attempt_at=NULL,error_message=NULL,updated_at=? WHERE id=? AND user_id=?').bind(content,status,scheduledAt,body.timezone ?? current.timezone,now,id,user.id).run()
+  try {
+    await c.env.DB.batch([
+      c.env.DB.prepare('UPDATE posts SET content=?,status=?,scheduled_at=?,timezone=?,attempts=0,next_attempt_at=NULL,error_message=NULL,updated_at=? WHERE id=? AND user_id=?').bind(content,status,scheduledAt,body.timezone ?? current.timezone,now,id,user.id),
+      ...destinationStatements(c.env, id, destinationIds, now),
+    ])
+  } catch { return c.json({ error: 'No fue posible actualizar la publicación' }, 500) }
   return c.json({ post: await c.env.DB.prepare('SELECT * FROM posts WHERE id=? AND user_id=?').bind(id,user.id).first() })
 })
 
@@ -113,9 +160,9 @@ app.put('/api/posts/:id/destinations', async (c) => {
     const owned = await c.env.DB.prepare(`SELECT d.id FROM destinations d JOIN facebook_accounts a ON a.id=d.facebook_account_id WHERE a.user_id=? AND d.id IN (${placeholders})`).bind(userId, ...ids).all<{id:string}>()
     if (owned.results.length !== ids.length) return c.json({ error: 'Uno o más destinos no pertenecen a tu cuenta' }, 403)
   }
+  if (post.status === 'scheduled' && ids.length === 0) return c.json({ error: 'Una publicación programada requiere al menos un destino' }, 400)
   const now = new Date().toISOString()
-  await c.env.DB.prepare('DELETE FROM post_destinations WHERE post_id=?').bind(postId).run()
-  for (const destinationId of ids) await c.env.DB.prepare(`INSERT INTO post_destinations (post_id,destination_id,status,provider_post_id,error_message,published_at,created_at,updated_at) VALUES (?,?, 'pending',NULL,NULL,NULL,?,?)`).bind(postId, destinationId, now, now).run()
+  try { await c.env.DB.batch(destinationStatements(c.env, postId, ids, now)) } catch { return c.json({ error: 'No fue posible actualizar los destinos' }, 500) }
   const rows = await c.env.DB.prepare(`SELECT d.id,d.type,d.provider_id,d.name,d.metadata_json,pd.status,pd.provider_post_id,pd.error_message,pd.published_at FROM destinations d JOIN post_destinations pd ON pd.destination_id=d.id JOIN facebook_accounts a ON a.id=d.facebook_account_id WHERE pd.post_id=? AND a.user_id=? ORDER BY d.name`).bind(postId,userId).all()
   return c.json({ destinations: rows.results })
 })
