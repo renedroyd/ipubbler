@@ -1,4 +1,5 @@
 import type { Env } from '../types'
+import { decryptMetaToken, MetaClient, requireMetaEncryptionSecret } from '../meta'
 
 export interface PublishRequest {
   destinationId: string
@@ -11,21 +12,34 @@ export interface PublishResult {
   destinationId: string
 }
 
-/**
- * Provider boundary for social publication.
- *
- * This deliberately contains no Graph API assumptions about unsupported
- * destinations. The concrete Meta implementation will be enabled only after
- * the required permissions and destination capabilities are configured.
- */
 export interface SocialPublisher {
   publish(request: PublishRequest): Promise<PublishResult>
 }
 
-export function createMetaPublisher(_env: Env): SocialPublisher {
+export function createMetaPublisher(env: Env, userId: string): SocialPublisher {
   return {
-    async publish(_request: PublishRequest): Promise<PublishResult> {
-      throw new Error('Meta publishing adapter is not configured yet')
+    async publish(request) {
+      const destination = await env.DB.prepare(`
+        SELECT d.id,d.type,d.provider_id,d.access_token_encrypted
+        FROM destinations d
+        JOIN facebook_accounts a ON a.id=d.facebook_account_id
+        WHERE d.id=? AND a.user_id=?
+      `).bind(request.destinationId, userId).first<{
+        id: string
+        type: 'page' | 'profile' | 'group'
+        provider_id: string
+        access_token_encrypted: string | null
+      }>()
+
+      if (!destination) throw new Error('Destino no encontrado')
+      if (destination.type !== 'page') throw new Error(`El destino ${destination.type} todavía no tiene un adaptador de publicación habilitado`)
+      if (!destination.access_token_encrypted) throw new Error('El destino no tiene un token de acceso configurado')
+
+      const secret = requireMetaEncryptionSecret(env)
+      const pageAccessToken = await decryptMetaToken(destination.access_token_encrypted, secret)
+      const meta = new MetaClient(env)
+      const result = await meta.publishPagePost(destination.provider_id, pageAccessToken, request.message)
+      return { providerId: result.id, destinationId: destination.id }
     },
   }
 }
