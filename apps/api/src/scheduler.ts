@@ -43,11 +43,15 @@ export async function processDuePosts(env: Env): Promise<{ processed: number; pu
     ).bind(post.id).all<{ r2_key: string }>()
     const mediaKeys = mediaRows.results.map(item => item.r2_key)
 
+    // A post may be created as scheduled and have its destinations associated
+    // by the next API request. Keep it scheduled instead of converting it to a
+    // permanent failure if the cron happens to run between those requests.
     if (!destinations.results.length) {
-      const message = 'La publicación no tiene destinos configurados.'
-      await env.DB.prepare(`UPDATE posts SET status='failed',error_message=?,updated_at=? WHERE id=?`).bind(message, now, post.id).run()
-      await env.DB.prepare('INSERT INTO publication_logs (id,post_id,status,message,created_at) VALUES (?,?,?,?,?)').bind(crypto.randomUUID(), post.id, 'failed', message, now).run()
-      failed++
+      await env.DB.prepare(`
+        UPDATE posts
+        SET status='scheduled', next_attempt_at=NULL, error_message=NULL, updated_at=?
+        WHERE id=? AND status='processing'
+      `).bind(now, post.id).run()
       continue
     }
 
