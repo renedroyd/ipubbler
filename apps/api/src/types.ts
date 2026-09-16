@@ -3,6 +3,7 @@ export interface Env {
   MEDIA_BUCKET: R2Bucket
   SESSION_SECRET: string
   SETUP_SECRET?: string
+  FRONTEND_URL?: string
   META_ACCESS_TOKEN?: string
   META_APP_ID?: string
   META_APP_SECRET?: string
