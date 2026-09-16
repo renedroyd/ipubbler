@@ -3,15 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
-  },
-  "dependencies": {
-    "hono": "^4.9.0"
-  },
-  "devDependencies": {
-    "wrangler": "^4.35.0",
-    "typescript": "^5.9.0"
-  }
+  "scripts": { "dev": "wrangler dev", "deploy": "wrangler deploy" },
+  "dependencies": { "hono": "^4.9.0" },
+  "devDependencies": { "@cloudflare/workers-types": "^4.20260916.0", "wrangler": "^4.35.0", "typescript": "^5.9.0" }
 }
