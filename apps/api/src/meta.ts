@@ -63,6 +63,14 @@ export class MetaClient {
   async listPages(userAccessToken: string) {
     return this.request<{ data: MetaPage[] }>('me/accounts?fields=id,name,access_token,tasks', userAccessToken)
   }
+
+  async publishPagePost(pageId: string, pageAccessToken: string, message: string) {
+    return this.request<{ id: string }>(`${pageId}/feed`, pageAccessToken, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+      body: new URLSearchParams({ message }).toString(),
+    })
+  }
 }
 
 export function requireMetaEncryptionSecret(env: Env): string {
