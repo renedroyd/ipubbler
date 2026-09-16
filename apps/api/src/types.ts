@@ -1,8 +1,17 @@
-export interface Env {
+export interface Bindings {
   DB: D1Database
   MEDIA_BUCKET: R2Bucket
   SESSION_SECRET: string
   SETUP_SECRET?: string
+}
+
+export interface Variables {
+  user: SessionUser
+}
+
+export interface AppEnv {
+  Bindings: Bindings
+  Variables: Variables
 }
 
 export interface User {
