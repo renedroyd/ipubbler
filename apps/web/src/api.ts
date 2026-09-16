@@ -10,7 +10,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 }
 
 export interface User { id: string; email: string; name: string }
-export interface Post { id: string; content: string; status: string; scheduled_at: string | null; timezone: string; created_at: string; updated_at: string; error_message?: string | null; media_count?: number }
+export interface Post { id: string; content: string; status: string; scheduled_at: string | null; timezone: string; created_at: string; updated_at: string; error_message?: string | null; media_count?: number; destination_count?: number }
 export interface Media { id: string; post_id: string; filename: string; mime_type: string; size: number; sort_order: number; created_at: string }
 export interface PublicationLog { id: string; post_id: string; status: string; message: string | null; created_at: string }
 export interface Destination { id: string; type: 'page' | 'profile' | 'group' | string; provider_id: string; name: string; metadata_json?: string | null; status?: string; provider_post_id?: string | null; error_message?: string | null; published_at?: string | null }
@@ -23,8 +23,8 @@ export const api = {
   logout: () => request<{ ok: boolean }>('/api/auth/logout', { method: 'POST' }),
   stats: () => request<{ stats: Record<string, number> }>('/api/dashboard/stats'),
   posts: (status?: string) => request<{ posts: Post[] }>(`/api/posts${status ? `?status=${encodeURIComponent(status)}` : ''}`),
-  createPost: (content: string, scheduled_at: string | null, timezone: string) => request<{ post: Post }>('/api/posts', { method: 'POST', body: JSON.stringify({ content, scheduled_at, timezone }) }),
-  updatePost: (id: string, payload: { content?: string; scheduled_at?: string | null; timezone?: string }) => request<{ post: Post }>(`/api/posts/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
+  createPost: (content: string, scheduled_at: string | null, timezone: string, destination_ids: string[] = []) => request<{ post: Post }>('/api/posts', { method: 'POST', body: JSON.stringify({ content, scheduled_at, timezone, destination_ids }) }),
+  updatePost: (id: string, payload: { content?: string; scheduled_at?: string | null; timezone?: string; destination_ids?: string[] }) => request<{ post: Post }>(`/api/posts/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
   deletePost: (id: string) => request<{ ok: boolean }>(`/api/posts/${id}`, { method: 'DELETE' }),
   media: (postId: string) => request<{ media: Media[] }>(`/api/posts/${postId}/media`),
   uploadMedia: async (postId: string, file: File) => { const form = new FormData(); form.append('file', file); return request<{ media: Media }>(`/api/posts/${postId}/media`, { method: 'POST', body: form }) },
