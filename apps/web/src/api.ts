@@ -17,17 +17,84 @@ export interface Destination { id: string; type: 'page' | 'profile' | 'group' | 
 export interface MetaAccount { id: string; provider_user_id: string; name: string; token_expires_at?: string | null; created_at?: string; updated_at?: string }
 export interface CalendarPost extends Post { destination_count?: number }
 
+type PendingFinalization = {
+  scheduled_at: string
+  timezone: string
+  destination_ids: string[]
+  remaining_uploads: number
+}
+
+const pendingFinalizations = new Map<string, PendingFinalization>()
+
+function selectedUploadCount(): number {
+  if (typeof document === 'undefined') return 0
+  const input = document.querySelector('input[type="file"]') as HTMLInputElement | null
+  return input?.files?.length ?? 0
+}
+
+async function finalizePendingPost(postId: string, plan: PendingFinalization): Promise<Post> {
+  const result = await request<{ post: Post }>(`/api/posts/${postId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({
+      scheduled_at: plan.scheduled_at,
+      timezone: plan.timezone,
+      destination_ids: plan.destination_ids,
+    }),
+  })
+  pendingFinalizations.delete(postId)
+  return result.post
+}
+
 export const api = {
   me: () => request<{ user: User | null }>('/api/auth/me'),
   login: (email: string, password: string) => request<{ user: User }>('/api/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) }),
   logout: () => request<{ ok: boolean }>('/api/auth/logout', { method: 'POST' }),
   stats: () => request<{ stats: Record<string, number> }>('/api/dashboard/stats'),
   posts: (status?: string) => request<{ posts: Post[] }>(`/api/posts${status ? `?status=${encodeURIComponent(status)}` : ''}`),
-  createPost: (content: string, scheduled_at: string | null, timezone: string, destination_ids: string[] = []) => request<{ post: Post }>('/api/posts', { method: 'POST', body: JSON.stringify({ content, scheduled_at, timezone, destination_ids }) }),
-  updatePost: (id: string, payload: { content?: string; scheduled_at?: string | null; timezone?: string; destination_ids?: string[] }) => request<{ post: Post }>(`/api/posts/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
+  createPost: async (content: string, scheduled_at: string | null, timezone: string, destination_ids: string[] = []) => {
+    const uploadCount = scheduled_at ? selectedUploadCount() : 0
+    const result = await request<{ post: Post }>('/api/posts', {
+      method: 'POST',
+      body: JSON.stringify({
+        content,
+        scheduled_at: uploadCount > 0 ? null : scheduled_at,
+        timezone,
+        destination_ids,
+      }),
+    })
+    if (scheduled_at && uploadCount > 0) {
+      pendingFinalizations.set(result.post.id, { scheduled_at, timezone, destination_ids, remaining_uploads: uploadCount })
+    }
+    return result
+  },
+  updatePost: async (id: string, payload: { content?: string; scheduled_at?: string | null; timezone?: string; destination_ids?: string[] }) => {
+    const uploadCount = payload.scheduled_at ? selectedUploadCount() : 0
+    const result = await request<{ post: Post }>(`/api/posts/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ ...payload, scheduled_at: uploadCount > 0 ? null : payload.scheduled_at }),
+    })
+    if (payload.scheduled_at && uploadCount > 0) {
+      pendingFinalizations.set(id, {
+        scheduled_at: payload.scheduled_at,
+        timezone: payload.timezone ?? result.post.timezone,
+        destination_ids: payload.destination_ids ?? [],
+        remaining_uploads: uploadCount,
+      })
+    }
+    return result
+  },
   deletePost: (id: string) => request<{ ok: boolean }>(`/api/posts/${id}`, { method: 'DELETE' }),
   media: (postId: string) => request<{ media: Media[] }>(`/api/posts/${postId}/media`),
-  uploadMedia: async (postId: string, file: File) => { const form = new FormData(); form.append('file', file); return request<{ media: Media }>(`/api/posts/${postId}/media`, { method: 'POST', body: form }) },
+  uploadMedia: async (postId: string, file: File) => {
+    const form = new FormData(); form.append('file', file)
+    const result = await request<{ media: Media }>(`/api/posts/${postId}/media`, { method: 'POST', body: form })
+    const plan = pendingFinalizations.get(postId)
+    if (plan) {
+      plan.remaining_uploads -= 1
+      if (plan.remaining_uploads <= 0) await finalizePendingPost(postId, plan)
+    }
+    return result
+  },
   deleteMedia: (id: string) => request<{ ok: boolean }>(`/api/media/${id}`, { method: 'DELETE' }),
   logs: (postId: string) => request<{ logs: PublicationLog[] }>(`/api/posts/${postId}/logs`),
   mediaUrl: (id: string) => `${API_BASE}/api/media/${id}`,
