@@ -2,6 +2,46 @@ import { createMetaPublisher } from './meta/publisher'
 import type { Env } from './types'
 
 const MAX_ATTEMPTS = 5
+const PROCESSING_LEASE_MS = 10 * 60 * 1000
+
+function leaseExpiredBefore(now: Date): string {
+  return new Date(now.getTime() - PROCESSING_LEASE_MS).toISOString()
+}
+
+async function recoverAbandonedProcessing(env: Env, now: Date): Promise<void> {
+  const nowIso = now.toISOString()
+  const staleBefore = leaseExpiredBefore(now)
+
+  // A destination may have been left in `processing` if the Worker stopped
+  // while the provider request was in flight. Mark it failed so the normal
+  // retry path can handle it. Provider idempotency must still be added before
+  // production to eliminate the residual duplicate-publication risk.
+  await env.DB.prepare(`
+    UPDATE post_destinations
+    SET status='failed',
+        error_message='El procesamiento anterior expiró y será reintentado.',
+        processing_at=NULL,
+        updated_at=?
+    WHERE status='processing'
+      AND processing_at IS NOT NULL
+      AND processing_at <= ?
+  `).bind(nowIso, staleBefore).run()
+
+  // Recover posts whose Worker invocation ended before the post could reach a
+  // terminal state. Already-published destinations remain published and will
+  // be skipped by the destination claim below.
+  await env.DB.prepare(`
+    UPDATE posts
+    SET status='scheduled',
+        next_attempt_at=?,
+        error_message='El procesamiento anterior expiró y la publicación será reintentada.',
+        processing_at=NULL,
+        updated_at=?
+    WHERE status='processing'
+      AND processing_at IS NOT NULL
+      AND processing_at <= ?
+  `).bind(nowIso, nowIso, staleBefore).run()
+}
 
 export async function processDuePosts(env: Env): Promise<{ processed: number; published: number; failed: number }> {
   // The current publisher is Meta-based. Do not consume scheduled posts while
@@ -11,7 +51,10 @@ export async function processDuePosts(env: Env): Promise<{ processed: number; pu
     return { processed: 0, published: 0, failed: 0 }
   }
 
-  const now = new Date().toISOString()
+  const nowDate = new Date()
+  const now = nowDate.toISOString()
+  await recoverAbandonedProcessing(env, nowDate)
+
   const due = await env.DB.prepare(
     `SELECT id, user_id, content, attempts FROM posts
      WHERE status = 'scheduled' AND scheduled_at IS NOT NULL
@@ -24,9 +67,11 @@ export async function processDuePosts(env: Env): Promise<{ processed: number; pu
   let failed = 0
 
   for (const post of due.results) {
+    const processingAt = new Date().toISOString()
     const claim = await env.DB.prepare(
-      `UPDATE posts SET status='processing', updated_at=? WHERE id=? AND status='scheduled'`,
-    ).bind(now, post.id).run()
+      `UPDATE posts SET status='processing', processing_at=?, updated_at=?
+       WHERE id=? AND status='scheduled'`,
+    ).bind(processingAt, processingAt, post.id).run()
     if (!claim.meta.changes) continue
 
     const destinations = await env.DB.prepare(`
@@ -49,9 +94,10 @@ export async function processDuePosts(env: Env): Promise<{ processed: number; pu
     if (!destinations.results.length) {
       await env.DB.prepare(`
         UPDATE posts
-        SET status='scheduled', next_attempt_at=NULL, error_message=NULL, updated_at=?
+        SET status='scheduled', next_attempt_at=NULL, error_message=NULL,
+            processing_at=NULL, updated_at=?
         WHERE id=? AND status='processing'
-      `).bind(now, post.id).run()
+      `).bind(new Date().toISOString(), post.id).run()
       continue
     }
 
@@ -60,30 +106,38 @@ export async function processDuePosts(env: Env): Promise<{ processed: number; pu
     let destinationAttempts = 0
 
     for (const destination of destinations.results) {
+      const destinationProcessingAt = new Date().toISOString()
       const claimDestination = await env.DB.prepare(
-        `UPDATE post_destinations SET status='processing',error_message=NULL,updated_at=?
+        `UPDATE post_destinations
+         SET status='processing', error_message=NULL, processing_at=?, updated_at=?
          WHERE post_id=? AND destination_id=? AND status IN ('pending','failed')`,
-      ).bind(now, post.id, destination.id).run()
+      ).bind(destinationProcessingAt, destinationProcessingAt, post.id, destination.id).run()
       if (!claimDestination.meta.changes) continue
       destinationAttempts++
 
       try {
         const result = await publisher.publish({ destinationId: destination.id, message: post.content, mediaKeys })
+        const completedAt = new Date().toISOString()
         await env.DB.prepare(
-          `UPDATE post_destinations SET status='published',provider_post_id=?,published_at=?,updated_at=? WHERE post_id=? AND destination_id=?`,
-        ).bind(result.providerId, now, now, post.id, destination.id).run()
+          `UPDATE post_destinations
+           SET status='published',provider_post_id=?,published_at=?,processing_at=NULL,updated_at=?
+           WHERE post_id=? AND destination_id=? AND status='processing'`,
+        ).bind(result.providerId, completedAt, completedAt, post.id, destination.id).run()
         await env.DB.prepare(
           'INSERT INTO publication_logs (id,post_id,status,message,created_at) VALUES (?,?,?,?,?)',
-        ).bind(crypto.randomUUID(), post.id, 'published', `Publicado en destino ${destination.id}`, now).run()
+        ).bind(crypto.randomUUID(), post.id, 'published', `Publicado en destino ${destination.id}`, completedAt).run()
       } catch (error) {
         destinationFailures++
+        const completedAt = new Date().toISOString()
         const message = error instanceof Error ? error.message : String(error)
         await env.DB.prepare(
-          `UPDATE post_destinations SET status='failed',error_message=?,updated_at=? WHERE post_id=? AND destination_id=?`,
-        ).bind(message, now, post.id, destination.id).run()
+          `UPDATE post_destinations
+           SET status='failed',error_message=?,processing_at=NULL,updated_at=?
+           WHERE post_id=? AND destination_id=? AND status='processing'`,
+        ).bind(message, completedAt, post.id, destination.id).run()
         await env.DB.prepare(
           'INSERT INTO publication_logs (id,post_id,status,message,created_at) VALUES (?,?,?,?,?)',
-        ).bind(crypto.randomUUID(), post.id, 'failed', message, now).run()
+        ).bind(crypto.randomUUID(), post.id, 'failed', message, completedAt).run()
       }
     }
 
@@ -92,13 +146,22 @@ export async function processDuePosts(env: Env): Promise<{ processed: number; pu
     ).bind(post.id).first<{ count: number }>()
 
     if (!Number(remaining?.count)) {
-      await env.DB.prepare(`UPDATE posts SET status='published',published_at=?,next_attempt_at=NULL,error_message=NULL,updated_at=? WHERE id=?`).bind(now, now, post.id).run()
+      const completedAt = new Date().toISOString()
+      await env.DB.prepare(`
+        UPDATE posts
+        SET status='published',published_at=?,next_attempt_at=NULL,error_message=NULL,
+            processing_at=NULL,updated_at=?
+        WHERE id=? AND status='processing'
+      `).bind(completedAt, completedAt, post.id).run()
       published++
       continue
     }
 
     if (!destinationAttempts) {
-      await env.DB.prepare(`UPDATE posts SET status='scheduled',updated_at=? WHERE id=? AND status='processing'`).bind(now, post.id).run()
+      await env.DB.prepare(`
+        UPDATE posts SET status='scheduled',processing_at=NULL,updated_at=?
+        WHERE id=? AND status='processing'
+      `).bind(new Date().toISOString(), post.id).run()
       continue
     }
 
@@ -107,12 +170,22 @@ export async function processDuePosts(env: Env): Promise<{ processed: number; pu
       const message = destinationFailures
         ? 'Se alcanzó el máximo de intentos de publicación.'
         : 'La publicación no pudo completar todos sus destinos.'
-      await env.DB.prepare(`UPDATE posts SET status='failed',attempts=?,next_attempt_at=NULL,error_message=?,updated_at=? WHERE id=?`).bind(attempts, message, now, post.id).run()
+      const completedAt = new Date().toISOString()
+      await env.DB.prepare(`
+        UPDATE posts
+        SET status='failed',attempts=?,next_attempt_at=NULL,error_message=?,processing_at=NULL,updated_at=?
+        WHERE id=? AND status='processing'
+      `).bind(attempts, message, completedAt, post.id).run()
       failed++
     } else {
       const delaySeconds = Math.min(60 * 2 ** attempts, 3600)
       const retryAt = new Date(Date.now() + delaySeconds * 1000).toISOString()
-      await env.DB.prepare(`UPDATE posts SET status='scheduled',attempts=?,next_attempt_at=?,error_message=?,updated_at=? WHERE id=?`).bind(attempts, retryAt, 'Una o más publicaciones no pudieron completarse; se reintentará automáticamente.', now, post.id).run()
+      const completedAt = new Date().toISOString()
+      await env.DB.prepare(`
+        UPDATE posts
+        SET status='scheduled',attempts=?,next_attempt_at=?,error_message=?,processing_at=NULL,updated_at=?
+        WHERE id=? AND status='processing'
+      `).bind(attempts, retryAt, 'Una o más publicaciones no pudieron completarse; se reintentará automáticamente.', completedAt, post.id).run()
     }
   }
 
