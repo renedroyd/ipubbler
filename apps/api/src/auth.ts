@@ -31,7 +31,7 @@ export async function hashPassword(password: string): Promise<string> {
   crypto.getRandomValues(salt)
   const material = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits'])
   const bits = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', salt: salt.buffer, iterations: 210_000, hash: 'SHA-256' },
+    { name: 'PBKDF2', salt: salt.buffer as ArrayBuffer, iterations: 210_000, hash: 'SHA-256' },
     material,
     256,
   )
@@ -46,7 +46,7 @@ export async function verifyPassword(password: string, encoded: string): Promise
   const material = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits'])
   const salt = base64ToBytes(saltText)
   const bits = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', salt: salt.buffer, iterations, hash: 'SHA-256' },
+    { name: 'PBKDF2', salt: salt.buffer as ArrayBuffer, iterations, hash: 'SHA-256' },
     material,
     256,
   )
@@ -64,7 +64,7 @@ export async function createSession(db: D1Database, user: SessionUser): Promise<
   const now = new Date()
   const expires = new Date(now.getTime() + SESSION_DAYS * 24 * 60 * 60 * 1000)
   await db.prepare(
-    'INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)',
+    'INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?) ',
   ).bind(crypto.randomUUID(), user.id, tokenHash, expires.toISOString(), now.toISOString()).run()
   return token
 }
