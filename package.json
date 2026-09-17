@@ -8,6 +8,11 @@
     "dev:web": "npm --workspace apps/web run dev",
     "build:web": "npm --workspace apps/web run build",
     "dev:api": "npm --workspace apps/api run dev",
-    "deploy:api": "npm --workspace apps/api run deploy"
+    "deploy:api": "npm --workspace apps/api run deploy",
+    "test": "npm --workspace apps/api run test",
+    "test:watch": "npm --workspace apps/api run test:watch"
+  },
+  "devDependencies": {
+    "vitest": "^3.2.4"
   }
 }
