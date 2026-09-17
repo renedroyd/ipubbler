@@ -21,3 +21,5 @@ jobs:
         run: npm run build:web
       - name: Typecheck API
         run: npx tsc --noEmit -p apps/api/tsconfig.json
+      - name: Test API
+        run: npm test
