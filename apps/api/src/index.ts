@@ -53,7 +53,7 @@ app.use('/api/meta/*', requireAuth)
 app.use('/api/destinations/*', requireAuth)
 app.use('/api/destinations', requireAuth)
 
-async function normalizeDestinationIds(env: AppEnv['Bindings'], userId: string, value: unknown): Promise<string[]> {
+export async function normalizeDestinationIds(env: AppEnv['Bindings'], userId: string, value: unknown): Promise<string[]> {
   if (value === undefined) return []
   if (!Array.isArray(value)) throw new Error('destination_ids debe ser un arreglo')
   const ids = Array.from(new Set(value.filter((id): id is string => typeof id === 'string' && id.trim().length > 0).map((id) => id.trim())))
@@ -174,8 +174,10 @@ app.put('/api/posts/:id/destinations', async (c) => {
 })
 
 app.get('/api/posts/:id/logs', async (c) => {
-  const post = await c.env.DB.prepare('SELECT id FROM posts WHERE id=? AND user_id=?').bind(c.req.param('id'), c.get('user').id).first(); if (!post) return c.json({ error: 'Publicación no encontrada' }, 404)
-  const logs = await c.env.DB.prepare('SELECT id,post_id,status,message,created_at FROM publication_logs WHERE post_id=? ORDER BY created_at DESC').bind(c.req.param('id')).all(); return c.json({ logs: logs.results })
+  const post = await c.env.DB.prepare('SELECT id FROM posts WHERE id=? AND user_id=?').bind(c.req.param('id'), c.get('user').id).first()
+  if (!post) return c.json({ error: 'Publicación no encontrada' }, 404)
+  const rows = await c.env.DB.prepare('SELECT id,status,message,created_at FROM publication_logs WHERE post_id=? ORDER BY created_at DESC').bind(c.req.param('id')).all()
+  return c.json({ logs: rows.results })
 })
 
 app.get('/api/media/:id', async (c) => {
