@@ -18,7 +18,7 @@ export type PostStatus = 'draft' | 'scheduled' | 'processing' | 'published' | 'f
 export interface Post {
   id: string; user_id: string; content: string; status: PostStatus
   scheduled_at: string | null; timezone: string; published_at: string | null
-  attempts: number; next_attempt_at: string | null; error_message: string | null
+  attempts: number; next_attempt_at: string | null; processing_at: string | null; error_message: string | null
   created_at: string; updated_at: string
 }
 
