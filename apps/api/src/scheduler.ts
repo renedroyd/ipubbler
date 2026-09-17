@@ -44,6 +44,9 @@ async function recoverAbandonedProcessing(env: Env, now: Date): Promise<void> {
 }
 
 export async function processDuePosts(env: Env): Promise<{ processed: number; published: number; failed: number }> {
+  const nowDate = new Date()
+  await recoverAbandonedProcessing(env, nowDate)
+
   // The current publisher is Meta-based. Do not consume scheduled posts while
   // the provider is not configured; this prevents a fresh deployment from
   // turning valid scheduled posts into failures before Meta is connected.
@@ -51,10 +54,7 @@ export async function processDuePosts(env: Env): Promise<{ processed: number; pu
     return { processed: 0, published: 0, failed: 0 }
   }
 
-  const nowDate = new Date()
   const now = nowDate.toISOString()
-  await recoverAbandonedProcessing(env, nowDate)
-
   const due = await env.DB.prepare(
     `SELECT id, user_id, content, attempts FROM posts
      WHERE status = 'scheduled' AND scheduled_at IS NOT NULL
@@ -88,9 +88,6 @@ export async function processDuePosts(env: Env): Promise<{ processed: number; pu
     ).bind(post.id).all<{ r2_key: string }>()
     const mediaKeys = mediaRows.results.map(item => item.r2_key)
 
-    // A post may be created as scheduled and have its destinations associated
-    // by the next API request. Keep it scheduled instead of converting it to a
-    // permanent failure if the cron happens to run between those requests.
     if (!destinations.results.length) {
       await env.DB.prepare(`
         UPDATE posts
