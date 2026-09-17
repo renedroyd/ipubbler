@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import { MAX_IMAGE_BYTES, validateImage, safeFilename } from './media'
 
-const file = (bytes: Uint8Array, type: string, name = 'photo.jpg') =>
-  new File([bytes], name, { type })
+const file = (bytes: Uint8Array, type: string, name = 'photo.jpg') => {
+  const buffer = new ArrayBuffer(bytes.byteLength)
+  new Uint8Array(buffer).set(bytes)
+  return new File([buffer], name, { type })
+}
 
 describe('media validation', () => {
   it('accepts valid JPEG, PNG, WebP and GIF signatures', async () => {
@@ -22,7 +25,7 @@ describe('media validation', () => {
 
   it('rejects empty and oversized files', async () => {
     await expect(validateImage(file(new Uint8Array(), 'image/jpeg'))).resolves.toContain('vacío')
-    await expect(validateImage(new File([new Uint8Array(MAX_IMAGE_BYTES + 1)], 'large.jpg', { type: 'image/jpeg' }))).resolves.toContain('10 MB')
+    await expect(validateImage(file(new Uint8Array(MAX_IMAGE_BYTES + 1), 'image/jpeg', 'large.jpg'))).resolves.toContain('10 MB')
   })
 
   it('sanitizes filenames and prevents path-like names', () => {
