@@ -118,9 +118,7 @@ app.patch('/api/posts/:id', async (c) => {
   const content = body.content !== undefined ? body.content.trim() : String(current.content); const scheduledAt = body.scheduled_at !== undefined ? body.scheduled_at : current.scheduled_at
   if (!content) return c.json({ error: 'El contenido no puede estar vacío' }, 400); if (scheduledAt && Number.isNaN(Date.parse(String(scheduledAt)))) return c.json({ error: 'scheduled_at inválido' }, 400); if (scheduledAt && Date.parse(String(scheduledAt)) <= Date.now()) return c.json({ error: 'La fecha programada debe estar en el futuro' }, 400)
   let destinationIds: string[]
-  try {
-    destinationIds = body.destination_ids !== undefined ? await normalizeDestinationIds(c.env, user.id, body.destination_ids) : await getPostDestinationIds(c.env, id)
-  } catch (error) { return c.json({ error: error instanceof Error ? error.message : 'Destinos inválidos' }, 400) }
+  try { destinationIds = body.destination_ids !== undefined ? await normalizeDestinationIds(c.env, user.id, body.destination_ids) : await getPostDestinationIds(c.env, id) } catch (error) { return c.json({ error: error instanceof Error ? error.message : 'Destinos inválidos' }, 400) }
   if (scheduledAt && destinationIds.length === 0) return c.json({ error: 'Una publicación programada requiere al menos un destino' }, 400)
   const now = new Date().toISOString(); const status: PostStatus = scheduledAt ? 'scheduled' : 'draft'
   try {
@@ -132,7 +130,15 @@ app.patch('/api/posts/:id', async (c) => {
   return c.json({ post: await c.env.DB.prepare('SELECT * FROM posts WHERE id=? AND user_id=?').bind(id,user.id).first() })
 })
 
-app.delete('/api/posts/:id', async (c) => { const result = await c.env.DB.prepare('DELETE FROM posts WHERE id=? AND user_id=?').bind(c.req.param('id'),c.get('user').id).run(); if (!result.meta.changes) return c.json({ error:'Publicación no encontrada' },404); return c.json({ ok:true }) })
+app.delete('/api/posts/:id', async (c) => {
+  const id = c.req.param('id')
+  const userId = c.get('user').id
+  const mediaRows = await c.env.DB.prepare('SELECT m.r2_key FROM media m JOIN posts p ON p.id=m.post_id WHERE m.post_id=? AND p.user_id=?').bind(id, userId).all<{ r2_key: string }>()
+  const result = await c.env.DB.prepare('DELETE FROM posts WHERE id=? AND user_id=?').bind(id, userId).run()
+  if (!result.meta.changes) return c.json({ error:'Publicación no encontrada' },404)
+  await Promise.allSettled(mediaRows.results.map((media) => c.env.MEDIA_BUCKET.delete(media.r2_key)))
+  return c.json({ ok:true })
+})
 app.post('/api/posts/:id/media', async (c) => uploadMedia(c, c.req.param('id')))
 
 app.get('/api/posts/:id/media', async (c) => {
@@ -196,13 +202,7 @@ app.post('/api/meta/connect', async (c) => {
   try { body = await c.req.json() } catch { return c.json({ error: 'JSON inválido' }, 400) }
   const userAccessToken = body.access_token?.trim()
   if (!userAccessToken) return c.json({ error: 'access_token requerido' }, 400)
-  try {
-    const meta = new MetaClient(c.env); const me = await meta.getMe(userAccessToken); const pages = await meta.listPages(userAccessToken); const secret = requireMetaEncryptionSecret(c.env); const now = new Date().toISOString(); const accountId = crypto.randomUUID(); const encryptedUserToken = await encryptMetaToken(userAccessToken, secret)
-    await c.env.DB.prepare(`INSERT INTO facebook_accounts (id,user_id,provider_user_id,name,access_token_encrypted,token_expires_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(user_id,provider_user_id) DO UPDATE SET name=excluded.name,access_token_encrypted=excluded.access_token_encrypted,updated_at=excluded.updated_at`).bind(accountId,c.get('user').id,me.id,me.name,encryptedUserToken,null,now,now).run()
-    const account = await c.env.DB.prepare('SELECT id FROM facebook_accounts WHERE user_id=? AND provider_user_id=?').bind(c.get('user').id,me.id).first<{id:string}>(); if (!account) throw new Error('No se pudo guardar la cuenta Meta')
-    for (const page of pages.data ?? []) { const encryptedPageToken = page.access_token ? await encryptMetaToken(page.access_token, secret) : null; await c.env.DB.prepare(`INSERT INTO destinations (id,facebook_account_id,type,provider_id,name,access_token_encrypted,metadata_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(facebook_account_id,type,provider_id) DO UPDATE SET name=excluded.name,access_token_encrypted=excluded.access_token_encrypted,metadata_json=excluded.metadata_json,updated_at=excluded.updated_at`).bind(crypto.randomUUID(),account.id,'page',page.id,page.name,encryptedPageToken,JSON.stringify({ tasks: page.tasks ?? [] }),now,now).run() }
-    return c.json({ ok: true, account: { id: account.id, provider_user_id: me.id, name: me.name }, pages: (pages.data ?? []).map((page) => ({ id: page.id, name: page.name, tasks: page.tasks ?? [] })) })
-  } catch (error) { return c.json({ error: error instanceof Error ? error.message : 'No se pudo conectar Meta' }, 400) }
+  try { const meta = new MetaClient(c.env); const me = await meta.getMe(userAccessToken); const pages = await meta.listPages(userAccessToken); const secret = requireMetaEncryptionSecret(c.env); const now = new Date().toISOString(); const accountId = crypto.randomUUID(); const encryptedUserToken = await encryptMetaToken(userAccessToken, secret); await c.env.DB.prepare(`INSERT INTO facebook_accounts (id,user_id,provider_user_id,name,access_token_encrypted,token_expires_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(user_id,provider_user_id) DO UPDATE SET name=excluded.name,access_token_encrypted=excluded.access_token_encrypted,updated_at=excluded.updated_at`).bind(accountId,c.get('user').id,me.id,me.name,encryptedUserToken,null,now,now).run(); const account = await c.env.DB.prepare('SELECT id FROM facebook_accounts WHERE user_id=? AND provider_user_id=?').bind(c.get('user').id,me.id).first<{id:string}>(); if (!account) throw new Error('No se pudo guardar la cuenta Meta'); for (const page of pages.data ?? []) { const encryptedPageToken = page.access_token ? await encryptMetaToken(page.access_token, secret) : null; await c.env.DB.prepare(`INSERT INTO destinations (id,facebook_account_id,type,provider_id,name,access_token_encrypted,metadata_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(facebook_account_id,type,provider_id) DO UPDATE SET name=excluded.name,access_token_encrypted=excluded.access_token_encrypted,metadata_json=excluded.metadata_json,updated_at=excluded.updated_at`).bind(crypto.randomUUID(),account.id,'page',page.id,page.name,encryptedPageToken,JSON.stringify({ tasks: page.tasks ?? [] }),now,now).run() } return c.json({ ok: true, account: { id: account.id, provider_user_id: me.id, name: me.name }, pages: (pages.data ?? []).map((page) => ({ id: page.id, name: page.name, tasks: page.tasks ?? [] })) }) } catch (error) { return c.json({ error: error instanceof Error ? error.message : 'No se pudo conectar Meta' }, 400) }
 })
 
 app.get('/api/destinations', async (c) => { const rows = await c.env.DB.prepare('SELECT d.id,d.type,d.provider_id,d.name,d.metadata_json,d.created_at,d.updated_at FROM destinations d JOIN facebook_accounts a ON a.id=d.facebook_account_id WHERE a.user_id=? ORDER BY d.name').bind(c.get('user').id).all(); return c.json({ destinations: rows.results }) })
