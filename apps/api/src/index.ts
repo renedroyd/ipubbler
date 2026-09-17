@@ -2,6 +2,7 @@ import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { clearSessionCookie, createSession, getSessionUser, hashPassword, requireAuth, setSessionCookie, verifyPassword, digest } from './auth'
 import { deleteMedia, uploadMedia } from './media'
+import { writePublicationLog } from './audit'
 import { processDuePosts } from './scheduler'
 import { encryptMetaToken, MetaClient, requireMetaEncryptionSecret } from './meta'
 import type { AppEnv, PostStatus } from './types'
@@ -103,6 +104,8 @@ app.post('/api/posts', async (c) => {
       ...destinationStatements(c.env, post.id, destinationIds, now).slice(1),
     ])
   } catch { return c.json({ error: 'No fue posible guardar la publicación' }, 500) }
+  await writePublicationLog(c.env, post.id, 'created', 'Publicación creada.', now)
+  if (scheduledAt) await writePublicationLog(c.env, post.id, 'scheduled', `Publicación programada para ${scheduledAt}.`, now)
   return c.json({ post }, 201)
 })
 
@@ -127,6 +130,8 @@ app.patch('/api/posts/:id', async (c) => {
       ...destinationStatements(c.env, id, destinationIds, now),
     ])
   } catch { return c.json({ error: 'No fue posible actualizar la publicación' }, 500) }
+  await writePublicationLog(c.env, id, 'updated', 'Publicación modificada.', now)
+  if (scheduledAt) await writePublicationLog(c.env, id, 'scheduled', `Publicación programada para ${scheduledAt}.`, now)
   return c.json({ post: await c.env.DB.prepare('SELECT * FROM posts WHERE id=? AND user_id=?').bind(id,user.id).first() })
 })
 
@@ -169,6 +174,7 @@ app.put('/api/posts/:id/destinations', async (c) => {
   if (post.status === 'scheduled' && ids.length === 0) return c.json({ error: 'Una publicación programada requiere al menos un destino' }, 400)
   const now = new Date().toISOString()
   try { await c.env.DB.batch(destinationStatements(c.env, postId, ids, now)) } catch { return c.json({ error: 'No fue posible actualizar los destinos' }, 500) }
+  await writePublicationLog(c.env, postId, 'updated', `Destinos de la publicación actualizados (${ids.length}).`, now)
   const rows = await c.env.DB.prepare(`SELECT d.id,d.type,d.provider_id,d.name,d.metadata_json,pd.status,pd.provider_post_id,pd.error_message,pd.published_at FROM destinations d JOIN post_destinations pd ON pd.destination_id=d.id JOIN facebook_accounts a ON a.id=d.facebook_account_id WHERE pd.post_id=? AND a.user_id=? ORDER BY d.name`).bind(postId,userId).all()
   return c.json({ destinations: rows.results })
 })
@@ -184,7 +190,7 @@ app.get('/api/media/:id', async (c) => {
   const media = await c.env.DB.prepare('SELECT m.id,m.r2_key,m.filename,m.mime_type,m.size FROM media m JOIN posts p ON p.id=m.post_id WHERE m.id=? AND p.user_id=?').bind(c.req.param('id'), c.get('user').id).first<{ id:string; r2_key:string; filename:string; mime_type:string; size:number }>()
   if (!media) return c.json({ error: 'Multimedia no encontrada' }, 404)
   const object = await c.env.MEDIA_BUCKET.get(media.r2_key); if (!object) return c.json({ error: 'Archivo no encontrado' }, 404)
-  const headers = new Headers(); object.writeHttpMetadata(headers); headers.set('etag', object.httpEtag); headers.set('content-disposition', `inline; filename="${media.filename}"`); return new Response(object.body, { headers })
+  const headers = new Headers(); object.writeHttpMetadata(headers); headers.set('etag', object.httpEtag); headers.set('content-disposition', `inline; filename=\"${media.filename}\"`); return new Response(object.body, { headers })
 })
 app.delete('/api/media/:id', async (c) => deleteMedia(c, c.req.param('id')))
 
