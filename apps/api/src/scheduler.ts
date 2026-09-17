@@ -1,21 +1,25 @@
 import { createMetaPublisher } from './meta/publisher'
 import type { Env } from './types'
 
-const MAX_ATTEMPTS = 5
-const PROCESSING_LEASE_MS = 10 * 60 * 1000
+export const MAX_ATTEMPTS = 5
+export const PROCESSING_LEASE_MS = 10 * 60 * 1000
 
-function leaseExpiredBefore(now: Date): string {
+export function leaseExpiredBefore(now: Date): string {
   return new Date(now.getTime() - PROCESSING_LEASE_MS).toISOString()
+}
+
+export function retryDelaySeconds(attempts: number): number {
+  return Math.min(60 * 2 ** attempts, 3600)
+}
+
+export function nextRetryAt(now: Date, attempts: number): string {
+  return new Date(now.getTime() + retryDelaySeconds(attempts) * 1000).toISOString()
 }
 
 async function recoverAbandonedProcessing(env: Env, now: Date): Promise<void> {
   const nowIso = now.toISOString()
   const staleBefore = leaseExpiredBefore(now)
 
-  // A destination may have been left in `processing` if the Worker stopped
-  // while the provider request was in flight. Mark it failed so the normal
-  // retry path can handle it. Provider idempotency must still be added before
-  // production to eliminate the residual duplicate-publication risk.
   await env.DB.prepare(`
     UPDATE post_destinations
     SET status='failed',
@@ -27,9 +31,6 @@ async function recoverAbandonedProcessing(env: Env, now: Date): Promise<void> {
       AND processing_at <= ?
   `).bind(nowIso, staleBefore).run()
 
-  // Recover posts whose Worker invocation ended before the post could reach a
-  // terminal state. Already-published destinations remain published and will
-  // be skipped by the destination claim below.
   await env.DB.prepare(`
     UPDATE posts
     SET status='scheduled',
@@ -47,9 +48,6 @@ export async function processDuePosts(env: Env): Promise<{ processed: number; pu
   const nowDate = new Date()
   await recoverAbandonedProcessing(env, nowDate)
 
-  // The current publisher is Meta-based. Do not consume scheduled posts while
-  // the provider is not configured; this prevents a fresh deployment from
-  // turning valid scheduled posts into failures before Meta is connected.
   if (!env.META_APP_ID || !env.META_APP_SECRET || !env.META_TOKEN_ENCRYPTION_KEY) {
     return { processed: 0, published: 0, failed: 0 }
   }
@@ -175,8 +173,7 @@ export async function processDuePosts(env: Env): Promise<{ processed: number; pu
       `).bind(attempts, message, completedAt, post.id).run()
       failed++
     } else {
-      const delaySeconds = Math.min(60 * 2 ** attempts, 3600)
-      const retryAt = new Date(Date.now() + delaySeconds * 1000).toISOString()
+      const retryAt = nextRetryAt(new Date(), attempts)
       const completedAt = new Date().toISOString()
       await env.DB.prepare(`
         UPDATE posts
