@@ -1,6 +1,6 @@
 import type { Env } from './types'
 
-export type PublicationLogStatus = 'created' | 'scheduled' | 'processing' | 'published' | 'failed' | 'retry'
+export type PublicationLogStatus = 'created' | 'updated' | 'scheduled' | 'processing' | 'published' | 'failed' | 'retry'
 
 export async function writePublicationLog(
   env: Env,
