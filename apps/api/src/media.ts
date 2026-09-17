@@ -1,8 +1,8 @@
 import type { Context } from 'hono'
 import type { AppEnv } from './types'
 
-const MAX_IMAGE_BYTES = 10 * 1024 * 1024
-const MAX_MEDIA_PER_POST = 10
+export const MAX_IMAGE_BYTES = 10 * 1024 * 1024
+export const MAX_MEDIA_PER_POST = 10
 const ALLOWED = new Map([
   ['image/jpeg', new Uint8Array([0xff, 0xd8, 0xff])],
   ['image/png', new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])],
@@ -14,7 +14,7 @@ function hasSignature(bytes: Uint8Array, signature: Uint8Array): boolean {
   return signature.every((value, index) => bytes[index] === value)
 }
 
-async function validateImage(file: File): Promise<string | null> {
+export async function validateImage(file: File): Promise<string | null> {
   if (!ALLOWED.has(file.type)) return 'Formato no permitido. Use JPG, PNG, WebP o GIF'
   if (file.size <= 0) return 'El archivo está vacío'
   if (file.size > MAX_IMAGE_BYTES) return 'La imagen supera el límite de 10 MB'
@@ -26,7 +26,7 @@ async function validateImage(file: File): Promise<string | null> {
   return null
 }
 
-function safeFilename(name: string): string {
+export function safeFilename(name: string): string {
   const normalized = name.normalize('NFKC').replace(/[^a-zA-Z0-9._-]/g, '_').replace(/\.{2,}/g, '.').replace(/^\.+/, '')
   return normalized.slice(0, 180) || 'image'
 }
