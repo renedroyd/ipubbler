@@ -58,15 +58,23 @@ export async function uploadMedia(c: Context<AppEnv>, postId: string): Promise<R
     })
 
     const maxOrder = await c.env.DB.prepare('SELECT COALESCE(MAX(sort_order), -1) AS value FROM media WHERE post_id = ?').bind(postId).first<{ value: number }>()
-    await c.env.DB.prepare(
-      'INSERT INTO media (id,post_id,filename,mime_type,r2_key,size,sort_order,created_at) VALUES (?,?,?,?,?,?,?,?)',
-    ).bind(mediaId, postId, safeName, file.type, key, file.size, Number(maxOrder?.value ?? -1) + 1, now).run()
+    const sortOrder = Number(maxOrder?.value ?? -1) + 1
+    try {
+      await c.env.DB.prepare(
+        'INSERT INTO media (id,post_id,filename,mime_type,r2_key,size,sort_order,created_at) VALUES (?,?,?,?,?,?,?,?)',
+      ).bind(mediaId, postId, safeName, file.type, key, file.size, sortOrder, now).run()
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('media_limit_exceeded')) {
+        return c.json({ error: `Una publicación puede tener como máximo ${MAX_MEDIA_PER_POST} imágenes` }, 400)
+      }
+      throw error
+    }
+
+    return c.json({ media: { id: mediaId, post_id: postId, filename: safeName, mime_type: file.type, size: file.size, r2_key: key, sort_order: sortOrder, created_at: now } }, 201)
   } catch {
     await c.env.MEDIA_BUCKET.delete(key).catch(() => undefined)
     return c.json({ error: 'No fue posible guardar la imagen' }, 500)
   }
-
-  return c.json({ media: { id: mediaId, post_id: postId, filename: safeName, mime_type: file.type, size: file.size, r2_key: key, sort_order: 0, created_at: now } }, 201)
 }
 
 export async function deleteMedia(c: Context<AppEnv>, mediaId: string): Promise<Response> {
